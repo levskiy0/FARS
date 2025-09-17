@@ -53,6 +53,7 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 	}
 	if opts.EnsureOpaque {
 		options.Background = bimg.Color{R: 255, G: 255, B: 255}
+		options.Extend = bimg.ExtendBackground
 	}
 	switch opts.Format {
 	case FormatJPEG:
