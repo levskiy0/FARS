@@ -1,0 +1,39 @@
+server:
+  host: 0.0.0.0
+  port: 9090
+
+storage:
+  base_dir: "/myservice/storage/"
+  cache_dir: "./temp"
+
+resize:
+  max_width: 2000
+  max_height: 2000
+  jpg_quality: 80
+  webp_quality: 75
+  avif_quality: 45
+  png_compression: 6
+
+cache:
+  ttl: "30d"
+  cleanup_interval: "24h"
+
+rewrites:
+  - pattern: "^(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$1$2.jpg"
+  - pattern: "^(\\d)(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$2/$1$2$3.jpg"
+  - pattern: "^(\\d)(\\d)(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$2/$3/$1$2$3$4.jpg"
+  - pattern: "^(\\d)(\\d)(\\d)(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$2/$3/$4/$1$2$3$4$5.jpg"
+  - pattern: "^(\\d)(\\d)(\\d)(\\d)(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$2/$3/$4/$5/$1$2$3$4$5$6.jpg"
+  - pattern: "^(\\d)(\\d)(\\d)(\\d)(\\d)(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$2/$3/$4/$5/$6/$1$2$3$4$5$6$7.jpg"
+  - pattern: "^(\\d)(\\d)(\\d)(\\d)(\\d)(\\d)(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$2/$3/$4/$5/$6/$7/$1$2$3$4$5$6$7$8.jpg"
+  - pattern: "^(\\d)(\\d)(\\d)(\\d)(\\d)(\\d)(\\d)(\\d)(-[\\w-]+)?/.+\\.jpg$"
+    replacement: "img/p/$1/$2/$3/$4/$5/$6/$7/$8/$1$2$3$4$5$6$7$8$9.jpg"
+  - pattern: "^c/([\\w.-]+)/.+\\.jpg$"
+    replacement: "img/c/$1.jpg"

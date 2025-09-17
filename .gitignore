@@ -1,0 +1,10 @@
+.idea
+.DS_Note
+build
+test
+
+config.yaml
+fars
+
+temp
+.gocache
