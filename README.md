@@ -14,7 +14,7 @@
 
 ## How a Request Is Served
 
-1. **Geometry parsing** – handles fixed dimensions (e.g. `200x200`) and zero for a free side (`0x400` ⇒ height locked to 400, width calculated proportionally).
+1. **Geometry parsing** – handles fixed dimensions (e.g. `200x200`), allows zero for a free side (`0x400` ⇒ height 400, width auto), and accepts shorthand like `120x` / `x120` which map to the same behaviour.
 2. **Path normalisation** – strips the leading slash, converts path separators to `/`, and executes the configured rewrite rules until the first match.
 3. **Source lookup** –
    - Checks the exact path requested.

@@ -276,15 +276,26 @@ func parseGeometry(geometry string) (int, int, error) {
 	if len(parts) != 2 {
 		return 0, 0, fmt.Errorf("invalid geometry %q", geometry)
 	}
-	width, err := strconv.Atoi(parts[0])
+	width, err := parseDimension(parts[0])
 	if err != nil {
 		return 0, 0, fmt.Errorf("invalid width: %w", err)
 	}
-	height, err := strconv.Atoi(parts[1])
+	height, err := parseDimension(parts[1])
 	if err != nil {
 		return 0, 0, fmt.Errorf("invalid height: %w", err)
 	}
 	return width, height, nil
+}
+
+func parseDimension(raw string) (int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
 }
 
 func buildETag(info os.FileInfo) string {

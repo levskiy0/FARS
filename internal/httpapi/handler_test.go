@@ -69,3 +69,56 @@ func TestBuildSourceCandidates(t *testing.T) {
 		})
 	}
 }
+
+func TestParseGeometry(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		width     int
+		height    int
+		expectErr bool
+	}{
+		{
+			name:   "both provided",
+			input:  "200x300",
+			width:  200,
+			height: 300,
+		},
+		{
+			name:   "missing height",
+			input:  "120x",
+			width:  120,
+			height: 0,
+		},
+		{
+			name:   "missing width",
+			input:  "x480",
+			width:  0,
+			height: 480,
+		},
+		{
+			name:      "invalid width",
+			input:     "axb",
+			expectErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			w, h, err := parseGeometry(tc.input)
+			if tc.expectErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if w != tc.width || h != tc.height {
+				t.Fatalf("parseGeometry(%q) = (%d,%d), want (%d,%d)", tc.input, w, h, tc.width, tc.height)
+			}
+		})
+	}
+}
