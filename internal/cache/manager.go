@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"log/slog"
@@ -90,6 +91,9 @@ func (m *Manager) StartCleanup(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
+		if err := m.cleanupOnce(ctx); err != nil {
+			m.logger.Error("cache cleanup failed", slog.Any("error", err))
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -112,11 +116,21 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 		return err
 	}
 	ttl := m.cfg.Cache.TTL.Duration
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	m.logger.Info("cache cleanup started", slog.String("root", root))
+	stats := cleanupStats{}
+	dirs := make([]string, 0, 16)
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			dirs = append(dirs, path)
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !isAllowedCacheExt(path) {
 			return nil
 		}
 		info, err := d.Info()
@@ -124,13 +138,10 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			return err
 		}
 		if ttl > 0 && time.Since(info.ModTime()) > ttl {
-			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				m.logger.Warn("remove stale cache", slog.String("path", path), slog.Any("error", removeErr))
+			if err := m.removeCacheFile(path, info.Size(), &stats); err != nil {
+				m.logger.Warn("remove stale cache", slog.String("path", path), slog.Any("error", err))
 			}
 			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
 		}
 		_, rel, ok := splitCachePath(m.cfg.Storage.CacheDir, path)
 		if !ok {
@@ -140,19 +151,41 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 		origInfo, err := os.Stat(origPath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-					m.logger.Warn("remove orphan cache", slog.String("path", path), slog.Any("error", removeErr))
+				if remErr := m.removeCacheFile(path, info.Size(), &stats); remErr != nil {
+					m.logger.Warn("remove orphan cache", slog.String("path", path), slog.Any("error", remErr))
 				}
 			}
 			return nil
 		}
 		if origInfo.ModTime().After(info.ModTime()) {
-			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				m.logger.Warn("remove outdated cache", slog.String("path", path), slog.Any("error", removeErr))
+			if err := m.removeCacheFile(path, info.Size(), &stats); err != nil {
+				m.logger.Warn("remove outdated cache", slog.String("path", path), slog.Any("error", err))
 			}
 		}
 		return nil
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		dir := dirs[i]
+		if dir == root {
+			continue
+		}
+		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
+			m.logger.Warn("remove cache dir", slog.String("path", dir), slog.Any("error", err))
+		}
+	}
+	if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
+		m.logger.Warn("remove cache root", slog.String("path", root), slog.Any("error", err))
+	}
+	m.logger.Info(
+		"cache cleanup finished",
+		slog.Int("files_removed", stats.files),
+		slog.String("bytes_removed", formatBytes(stats.bytes)),
+		slog.Int64("raw_bytes_removed", stats.bytes),
+	)
+	return nil
 }
 
 func splitCachePath(cacheRoot, candidate string) (geometry string, rel string, ok bool) {
@@ -165,4 +198,51 @@ func splitCachePath(cacheRoot, candidate string) (geometry string, rel string, o
 		return "", "", false
 	}
 	return parts[0], parts[1], true
+}
+
+type cleanupStats struct {
+	files int
+	bytes int64
+}
+
+var allowedCacheExtensions = map[string]struct{}{
+	".png":  {},
+	".avif": {},
+	".webp": {},
+	".jpg":  {},
+}
+
+func isAllowedCacheExt(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	_, ok := allowedCacheExtensions[ext]
+	return ok
+}
+
+func (m *Manager) removeCacheFile(path string, size int64, stats *cleanupStats) error {
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	stats.files++
+	stats.bytes += size
+	return nil
+}
+
+func formatBytes(n int64) string {
+	if n == 0 {
+		return "0 B"
+	}
+	sizes := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+	value := float64(n)
+	idx := 0
+	for value >= 1024 && idx < len(sizes)-1 {
+		value /= 1024
+		idx++
+	}
+	if idx == 0 {
+		return fmt.Sprintf("%d %s", n, sizes[idx])
+	}
+	return fmt.Sprintf("%.2f %s", value, sizes[idx])
 }
