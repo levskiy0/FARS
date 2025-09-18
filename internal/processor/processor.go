@@ -49,13 +49,34 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 	}
 	img := bimg.NewImage(source)
 
-	if opts.Width > 0 && opts.Height > 0 {
-		size, err := img.Size()
-		if err != nil {
-			return nil, fmt.Errorf("inspect source size: %w", err)
-		}
+	size, err := img.Size()
+	if err != nil {
+		return nil, fmt.Errorf("inspect source size: %w", err)
+	}
+	switch {
+	case opts.Width > 0 && opts.Height > 0:
 		if opts.Width > size.Width && opts.Height > size.Height {
 			return p.resizeWithCanvas(img, opts)
+		}
+	case opts.Width > 0 && opts.Height == 0:
+		if opts.Width > size.Width {
+			canvas := opts
+			scale := float64(size.Height) / float64(size.Width)
+			canvas.Height = int(math.Round(float64(opts.Width) * scale))
+			if canvas.Height < size.Height {
+				canvas.Height = size.Height
+			}
+			return p.resizeWithCanvas(img, canvas)
+		}
+	case opts.Height > 0 && opts.Width == 0:
+		if opts.Height > size.Height {
+			canvas := opts
+			scale := float64(size.Width) / float64(size.Height)
+			canvas.Width = int(math.Round(float64(opts.Height) * scale))
+			if canvas.Width < size.Width {
+				canvas.Width = size.Width
+			}
+			return p.resizeWithCanvas(img, canvas)
 		}
 	}
 	options, err := buildBaseOptions(opts)
