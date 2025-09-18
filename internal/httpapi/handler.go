@@ -79,6 +79,10 @@ func (h *Handler) handleResize(c *gin.Context) {
 		h.respondError(c, http.StatusBadRequest, errors.New("path is required"))
 		return
 	}
+
+	if strings.Contains(relative, "%20") {
+		relative = strings.ReplaceAll(relative, "%20", " ")
+	}
 	relative = strings.TrimPrefix(relative, "/")
 	relative = filepath.ToSlash(relative)
 	if strings.TrimSpace(relative) == "" {
