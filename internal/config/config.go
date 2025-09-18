@@ -1,3 +1,4 @@
+// internal/config/config.go
 package config
 
 import (
@@ -64,6 +65,32 @@ type CacheConfig struct {
 // Duration wraps time.Duration to support YAML strings like "30d".
 type Duration struct {
 	time.Duration
+}
+
+// defaultConfig returns sane defaults when no YAML is provided.
+func defaultConfig() *Config {
+	return &Config{
+		Server: ServerConfig{
+			Host: "0.0.0.0",
+			Port: 8080,
+		},
+		Storage: StorageConfig{
+			BaseDir:  "/data/base",
+			CacheDir: "/data/cache",
+		},
+		Resize: ResizeConfig{
+			MaxWidth:       2000,
+			MaxHeight:      2000,
+			JPGQuality:     80,
+			WebPQuality:    75,
+			AVIFQuality:    45,
+			PNGCompression: 6,
+		},
+		Cache: CacheConfig{
+			TTL:             Duration{30 * 24 * time.Hour}, // 30d
+			CleanupInterval: Duration{24 * time.Hour},      // 24h
+		},
+	}
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler.
@@ -137,6 +164,80 @@ func LoadReader(r io.Reader) (*Config, error) {
 	return &cfg, cfg.Validate()
 }
 
+// ApplyEnvOverrides updates configuration fields from environment variables if they are set.
+// Recognized variables:
+//
+//	PORT                -> Server.Port (int)
+//	IMAGES_BASE_DIR     -> Storage.BaseDir
+//	CACHE_DIR           -> Storage.CacheDir
+//	TTL                 -> Cache.TTL (Go duration string, e.g. "24h", "30m")
+//	CLEANUP_INTERVAL    -> Cache.CleanupInterval (Go duration string, e.g. "10m")
+func (c *Config) ApplyEnvOverrides() error {
+	// Ensure non-nil receiver
+	if c == nil {
+		return errors.New("nil config")
+	}
+	// Helper to get and trim
+	get := func(key string) string { return strings.TrimSpace(os.Getenv(key)) }
+
+	if v := strings.TrimSpace(get("PORT")); v != "" {
+		p, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("parse PORT=%q: %w", v, err)
+		}
+		c.Server.Port = p
+	}
+	// Default host inside containers if empty
+	if strings.TrimSpace(c.Server.Host) == "" {
+		c.Server.Host = "0.0.0.0"
+	}
+	if v := get("IMAGES_BASE_DIR"); v != "" {
+		c.Storage.BaseDir = v
+	}
+	if v := get("CACHE_DIR"); v != "" {
+		c.Storage.CacheDir = v
+	}
+	if v := get("TTL"); v != "" {
+		d, err := parseFlexibleDuration(v)
+		if err != nil {
+			return fmt.Errorf("parse TTL=%q: %w", v, err)
+		}
+		c.Cache.TTL = Duration{d}
+	}
+	if v := get("CLEANUP_INTERVAL"); v != "" {
+		d, err := parseFlexibleDuration(v)
+		if err != nil {
+			return fmt.Errorf("parse CLEANUP_INTERVAL=%q: %w", v, err)
+		}
+		c.Cache.CleanupInterval = Duration{d}
+	}
+	return nil
+}
+
+// LoadFromEnvOrFile loads configuration from YAML if path is provided;
+// otherwise starts from defaultConfig(). Env vars (if present) override both.
+func LoadFromEnvOrFile(path string) (*Config, error) {
+	var (
+		cfg *Config
+		err error
+	)
+	if strings.TrimSpace(path) != "" {
+		cfg, err = Load(path)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cfg = defaultConfig()
+	}
+	if err := cfg.ApplyEnvOverrides(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
 // Validate returns an error if required configuration values are missing or invalid.
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Server.Host) == "" {
@@ -208,7 +309,11 @@ func ensureDirExists(path string) error {
 	info, err := os.Stat(sanitized)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("path %s does not exist", sanitized)
+			// Create the directory tree if it doesn't exist
+			if mkErr := os.MkdirAll(sanitized, 0o755); mkErr != nil {
+				return fmt.Errorf("create dir %s: %w", sanitized, mkErr)
+			}
+			return nil
 		}
 		return err
 	}

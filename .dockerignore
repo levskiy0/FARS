@@ -1,0 +1,26 @@
+# ./.dockerignore
+**/.git
+**/.gitignore
+**/.github
+**/.DS_Store
+**/*.log
+**/node_modules
+**/dist
+**/build
+**/bin
+**/tmp
+**/*.test
+**/*.out
+**/*.swp
+**/*.swp
+**/*.swo
+
+# Go build artifacts
+**/*.a
+**/*.o
+**/vendor
+
+# IDE
+.vscode
+.idea
+*.iml

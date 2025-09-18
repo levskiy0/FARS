@@ -103,3 +103,24 @@ Key points:
 
 - Add end-to-end tests against the Gin router with a temporary filesystem.
 - Expose configurable logging levels and basic metrics.
+
+
+## Docker
+
+To build:
+```bash
+docker build -t fars:latest .
+```
+
+To run:
+```bash
+docker run --rm -p 8080:8080 \
+  -e PORT=8080 \
+  -e IMAGES_BASE_DIR=/data/base \
+  -e CACHE_DIR=/data/cache \
+  -e TTL=24h \
+  -e CLEANUP_INTERVAL=10m \
+  -v "$(pwd)/tests/images:/data/base" \
+  -v "$(pwd)/tests/cache:/data/cache" \
+  fars:latest
+```

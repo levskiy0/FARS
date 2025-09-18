@@ -1,3 +1,4 @@
+// cmd/fars-server/main.go
 package main
 
 import (
@@ -25,10 +26,7 @@ func newRootCommand() *cobra.Command {
 		Use:   "serve",
 		Short: "Start the image resize service",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if configPath == "" {
-				return fmt.Errorf("config path is required")
-			}
-			cfg, err := config.Load(configPath)
+			cfg, err := config.LoadFromEnvOrFile(configPath)
 			if err != nil {
 				return err
 			}
