@@ -147,8 +147,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 		if !ok {
 			return nil
 		}
-		origPath := filepath.Join(m.cfg.Storage.BaseDir, rel)
-		origInfo, err := os.Stat(origPath)
+		origInfo, err := m.lookupOriginalInfo(rel)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				if remErr := m.removeCacheFile(path, info.Size(), &stats); remErr != nil {
@@ -216,6 +215,30 @@ func isAllowedCacheExt(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	_, ok := allowedCacheExtensions[ext]
 	return ok
+}
+
+func (m *Manager) lookupOriginalInfo(rel string) (os.FileInfo, error) {
+	originalPath := filepath.Join(m.cfg.Storage.BaseDir, rel)
+	info, err := os.Stat(originalPath)
+	if err == nil {
+		return info, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	trimmed := strings.TrimSuffix(rel, filepath.Ext(rel))
+	if trimmed == rel {
+		return nil, err
+	}
+	fallbackPath := filepath.Join(m.cfg.Storage.BaseDir, trimmed)
+	info, fallbackErr := os.Stat(fallbackPath)
+	if fallbackErr == nil {
+		return info, nil
+	}
+	if errors.Is(fallbackErr, os.ErrNotExist) {
+		return nil, err
+	}
+	return nil, fallbackErr
 }
 
 func (m *Manager) removeCacheFile(path string, size int64, stats *cleanupStats) error {
