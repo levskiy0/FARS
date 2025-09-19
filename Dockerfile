@@ -21,16 +21,16 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/fars ./cmd/fars-server
 FROM alpine:3.22
 RUN apk add --no-cache vips ca-certificates
 WORKDIR /app
-
+RUN adduser -s /sbin/nologin -D fars
+USER fars
 # Copy the binary
-COPY --from=builder /out/fars .
+COPY --chown=fars:fars --from=builder /out/fars .
 
-# Volumes for data (override via env)
-VOLUME ["/data/images", "/data/cache"]
+VOLUME ["/app/data/cache"]
 
 ENV PORT=9090 \
-    IMAGES_BASE_DIR=/data/images \
-    CACHE_DIR=/data/cache \
+    IMAGES_BASE_DIR=/app/data/images \
+    CACHE_DIR=/app/data/cache \
     TTL=24h \
     CLEANUP_INTERVAL=10m
 
