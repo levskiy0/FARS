@@ -58,13 +58,21 @@ type ResizeConfig struct {
 
 // CacheConfig stores cache retention settings.
 type CacheConfig struct {
-	TTL             Duration `yaml:"ttl"`
-	CleanupInterval Duration `yaml:"cleanup_interval"`
+	TTL                 Duration `yaml:"ttl"`
+	CleanupInterval     Duration `yaml:"cleanup_interval"`
+	MemoryCacheSize     ByteSize `yaml:"memory_cache_size"`
+	MaxMemoryChunk      ByteSize `yaml:"max_memory_chunk"`
+	StorageHotCacheSize ByteSize `yaml:"storage_hot_cache_size"`
 }
 
 // Duration wraps time.Duration to support YAML strings like "30d".
 type Duration struct {
 	time.Duration
+}
+
+// ByteSize represents a capacity parsed from human readable strings (e.g. 300mb).
+type ByteSize struct {
+	Bytes int64
 }
 
 // defaultConfig returns sane defaults when no YAML is provided.
@@ -114,6 +122,27 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 	d.Duration = dur
+	return nil
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler for byte sizes.
+func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil {
+		return nil
+	}
+	if value.Kind != yaml.ScalarNode {
+		return fmt.Errorf("byte size must be a scalar, got kind %d", value.Kind)
+	}
+	raw := strings.TrimSpace(value.Value)
+	if raw == "" || strings.EqualFold(raw, "null") {
+		b.Bytes = 0
+		return nil
+	}
+	size, err := parseByteSize(raw)
+	if err != nil {
+		return err
+	}
+	b.Bytes = size
 	return nil
 }
 
@@ -172,6 +201,9 @@ func LoadReader(r io.Reader) (*Config, error) {
 //	CACHE_DIR           -> Storage.CacheDir
 //	TTL                 -> Cache.TTL (Go duration string, e.g. "24h", "30m")
 //	CLEANUP_INTERVAL    -> Cache.CleanupInterval (Go duration string, e.g. "10m")
+//	MEMORY_CACHE_SIZE   -> Cache.MemoryCacheSize (e.g. "300mb", "1gb")
+//	MAX_MEMORY_CHUNK    -> Cache.MaxMemoryChunk (e.g. "512kb")
+//	STORAGE_HOT_CACHE_SIZE -> Cache.StorageHotCacheSize (e.g. "100mb")
 func (c *Config) ApplyEnvOverrides() error {
 	// Ensure non-nil receiver
 	if c == nil {
@@ -210,6 +242,27 @@ func (c *Config) ApplyEnvOverrides() error {
 			return fmt.Errorf("parse CLEANUP_INTERVAL=%q: %w", v, err)
 		}
 		c.Cache.CleanupInterval = Duration{d}
+	}
+	if v := get("MEMORY_CACHE_SIZE"); v != "" {
+		size, err := parseByteSize(v)
+		if err != nil {
+			return fmt.Errorf("parse MEMORY_CACHE_SIZE=%q: %w", v, err)
+		}
+		c.Cache.MemoryCacheSize = ByteSize{Bytes: size}
+	}
+	if v := get("MAX_MEMORY_CHUNK"); v != "" {
+		size, err := parseByteSize(v)
+		if err != nil {
+			return fmt.Errorf("parse MAX_MEMORY_CHUNK=%q: %w", v, err)
+		}
+		c.Cache.MaxMemoryChunk = ByteSize{Bytes: size}
+	}
+	if v := get("STORAGE_HOT_CACHE_SIZE"); v != "" {
+		size, err := parseByteSize(v)
+		if err != nil {
+			return fmt.Errorf("parse STORAGE_HOT_CACHE_SIZE=%q: %w", v, err)
+		}
+		c.Cache.StorageHotCacheSize = ByteSize{Bytes: size}
 	}
 	return nil
 }
@@ -273,6 +326,9 @@ func (c *Config) Validate() error {
 	if c.Resize.PNGCompression < 0 || c.Resize.PNGCompression > 9 {
 		return fmt.Errorf("resize.png_compression must be within 0-9, got %d", c.Resize.PNGCompression)
 	}
+	if c.Cache.MemoryCacheSize.Bytes > 0 && c.Cache.MaxMemoryChunk.Bytes > c.Cache.MemoryCacheSize.Bytes {
+		return fmt.Errorf("cache.max_memory_chunk (%d) cannot exceed cache.memory_cache_size (%d)", c.Cache.MaxMemoryChunk.Bytes, c.Cache.MemoryCacheSize.Bytes)
+	}
 	return nil
 }
 
@@ -323,7 +379,10 @@ func ensureDirExists(path string) error {
 	return nil
 }
 
-var durationPattern = regexp.MustCompile(`(?i)^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$`)
+var (
+	durationPattern = regexp.MustCompile(`(?i)^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$`)
+	byteSizePattern = regexp.MustCompile(`(?i)^\s*(\d+)\s*([kmgtp]?i?b?)?\s*$`)
+)
 
 func parseFlexibleDuration(raw string) (time.Duration, error) {
 	matches := durationPattern.FindStringSubmatch(raw)
@@ -360,6 +419,55 @@ func parseFlexibleDuration(raw string) (time.Duration, error) {
 		total += secs
 	}
 	return total, nil
+}
+
+func parseByteSize(raw string) (int64, error) {
+	clean := strings.TrimSpace(raw)
+	if clean == "" {
+		return 0, nil
+	}
+	matches := byteSizePattern.FindStringSubmatch(clean)
+	if matches == nil {
+		return 0, fmt.Errorf("invalid size %q", raw)
+	}
+	value, err := strconv.ParseInt(matches[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse size %q: %w", matches[1], err)
+	}
+	unit := strings.ToLower(strings.TrimSpace(matches[2]))
+	if unit == "" || unit == "b" {
+		return value, nil
+	}
+	multiplier, ok := sizeMultiplier(unit)
+	if !ok {
+		return 0, fmt.Errorf("unknown size unit %q", matches[2])
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("size must be non-negative, got %d", value)
+	}
+	if value > 0 && multiplier > 0 && value > maxInt64/multiplier {
+		return 0, fmt.Errorf("size %q overflows", raw)
+	}
+	return value * multiplier, nil
+}
+
+const maxInt64 = int64(^uint64(0) >> 1)
+
+func sizeMultiplier(unit string) (int64, bool) {
+	switch unit {
+	case "k", "kb", "kib":
+		return 1 << 10, true
+	case "m", "mb", "mib":
+		return 1 << 20, true
+	case "g", "gb", "gib":
+		return 1 << 30, true
+	case "t", "tb", "tib":
+		return 1 << 40, true
+	case "p", "pb", "pib":
+		return 1 << 50, true
+	default:
+		return 0, false
+	}
 }
 
 // ResolveOriginalPath resolves a request path against base dir ensuring no traversal.
