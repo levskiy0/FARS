@@ -21,6 +21,7 @@ import (
 	"fars/internal/config"
 	"fars/internal/locker"
 	"fars/internal/processor"
+	"fars/internal/version"
 )
 
 var (
@@ -288,7 +289,7 @@ func (h *Handler) respondError(c *gin.Context, code int, err error) {
 		slog.String("geometry", c.Param("geometry")),
 		slog.String("path", c.Param("filepath")))
 	title := fmt.Sprintf("%d %s", code, http.StatusText(code))
-	body := fmt.Sprintf("<html><head><title>%s</title></head>\n<body>\n<center><h1>%s</h1></center>\n<hr><center>FARS</center>\n</body></html> ", title, title)
+	body := fmt.Sprintf("<html><head><title>%s</title></head>\n<body>\n<center><h1>%s</h1></center>\n<hr><center>%s</center>\n</body></html> ", title, title, version.Identifier())
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Header("Cache-Control", "no-cache")
 	c.String(code, body)

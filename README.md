@@ -37,7 +37,8 @@ No background conversions are performed—each request produces exactly one cach
 ## Quick Start
 
 ```bash
-go build -o fars ./cmd/fars-server
+VERSION=$(git describe --tags --dirty --always 2>/dev/null || echo dev)
+go build -ldflags "-X fars/internal/version.Version=${VERSION}" -o fars ./cmd/fars-server
 ./fars serve --config ./config.yaml
 
 # or without building ahead of time

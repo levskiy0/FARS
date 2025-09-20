@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	"fars/internal/config"
 	"fars/internal/locker"
 	"fars/internal/processor"
+	"fars/internal/version"
 )
 
 func TestBuildSourceCandidates(t *testing.T) {
@@ -286,6 +288,9 @@ func TestRespondErrorHTML(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodGet, "/resize/200x200/img/photo.jpg", nil)
 
+	version.Override("test-version")
+	expectedBody := fmt.Sprintf("<html><head><title>404 Not Found</title></head>\n<body>\n<center><h1>404 Not Found</h1></center>\n<hr><center>%s</center>\n</body></html> ", version.Identifier())
+
 	handler := &Handler{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
 	handler.respondError(c, http.StatusNotFound, errors.New("missing"))
@@ -293,8 +298,7 @@ func TestRespondErrorHTML(t *testing.T) {
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("unexpected status: %d", recorder.Code)
 	}
-	expected := "<html><head><title>404 Not Found</title></head>\n<body>\n<center><h1>404 Not Found</h1></center>\n<hr><center>FARS</center>\n</body></html> "
-	if body := recorder.Body.String(); body != expected {
+	if body := recorder.Body.String(); body != expectedBody {
 		t.Fatalf("unexpected body: %q", body)
 	}
 	if got := recorder.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
@@ -310,6 +314,9 @@ func TestHandleResizeUnsupportedMediaType(t *testing.T) {
 	c.Params = gin.Params{{Key: "geometry", Value: "200x200"}, {Key: "filepath", Value: "/foo.bmp"}}
 	c.Request = req
 
+	version.Override("test-version")
+	expectedBody := fmt.Sprintf("<html><head><title>415 Unsupported Media Type</title></head>\n<body>\n<center><h1>415 Unsupported Media Type</h1></center>\n<hr><center>%s</center>\n</body></html> ", version.Identifier())
+
 	handler := &Handler{
 		cfg:    &config.Config{Resize: config.ResizeConfig{MaxWidth: 5000, MaxHeight: 5000}},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -320,8 +327,7 @@ func TestHandleResizeUnsupportedMediaType(t *testing.T) {
 	if recorder.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("unexpected status: %d", recorder.Code)
 	}
-	expected := "<html><head><title>415 Unsupported Media Type</title></head>\n<body>\n<center><h1>415 Unsupported Media Type</h1></center>\n<hr><center>FARS</center>\n</body></html> "
-	if body := recorder.Body.String(); body != expected {
+	if body := recorder.Body.String(); body != expectedBody {
 		t.Fatalf("unexpected body: %q", body)
 	}
 }
