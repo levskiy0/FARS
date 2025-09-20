@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -448,8 +449,25 @@ func (c *Config) ResolveOriginalPath(relative string) (string, error) {
 
 // CachePath returns the computed cache path for requested geometry and asset.
 func (c *Config) CachePath(width, height int, relative string) string {
-	prefix := fmt.Sprintf("%dx%d", width, height)
+	prefix := formatGeometryPrefix(width, height)
 	prepared := strings.TrimPrefix(relative, "/")
 	clean := filepath.Clean(prepared)
 	return filepath.Join(c.Storage.CacheDir, prefix, filepath.FromSlash(clean))
+}
+
+func formatGeometryPrefix(width, height int) string {
+	var (
+		w string
+		h string
+	)
+	if width > 0 {
+		w = strconv.Itoa(width)
+	}
+	if height > 0 {
+		h = strconv.Itoa(height)
+	}
+	if w == "" && h == "" {
+		return "0x0"
+	}
+	return w + "x" + h
 }

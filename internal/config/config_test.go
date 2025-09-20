@@ -194,6 +194,47 @@ rewrites:
 	}
 }
 
+func TestCachePathFormatsSingleDimension(t *testing.T) {
+	cache := t.TempDir()
+	cfg := &Config{Storage: StorageConfig{CacheDir: cache}}
+
+	testCases := []struct {
+		name     string
+		width    int
+		height   int
+		relative string
+		expected string
+	}{
+		{
+			name:     "width only",
+			width:    100,
+			relative: "foo/bar.jpg",
+			expected: filepath.Join(cache, "100x", "foo", "bar.jpg"),
+		},
+		{
+			name:     "height only",
+			height:   150,
+			relative: "/foo/bar.jpg",
+			expected: filepath.Join(cache, "x150", "foo", "bar.jpg"),
+		},
+		{
+			name:     "zero dimensions",
+			relative: "foo/bar.jpg",
+			expected: filepath.Join(cache, "0x0", "foo", "bar.jpg"),
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			cachePath := cfg.CachePath(tc.width, tc.height, tc.relative)
+			if cachePath != tc.expected {
+				t.Fatalf("unexpected cache path: %s", cachePath)
+			}
+		})
+	}
+}
+
 func TestCacheSettingsFromYAML(t *testing.T) {
 	base := t.TempDir()
 	cache := t.TempDir()
