@@ -14,6 +14,7 @@ import (
 	"log/slog"
 
 	"fars/internal/config"
+	"fars/pkg/human"
 )
 
 // Manager handles cache lookups and maintenance.
@@ -180,7 +181,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 	}
 	m.logger.Info("cache cleanup finished",
 		slog.Int("files_removed", stats.files),
-		slog.String("bytes_removed", formatBytes(stats.bytes)),
+		slog.String("bytes_removed", human.FormatBytes(stats.bytes)),
 		slog.Int64("raw_bytes_removed", stats.bytes))
 	return nil
 }
@@ -249,21 +250,4 @@ func (m *Manager) removeCacheFile(path string, size int64, stats *cleanupStats) 
 	stats.files++
 	stats.bytes += size
 	return nil
-}
-
-func formatBytes(n int64) string {
-	if n == 0 {
-		return "0 B"
-	}
-	sizes := []string{"B", "KB", "MB", "GB", "TB", "PB"}
-	value := float64(n)
-	idx := 0
-	for value >= 1024 && idx < len(sizes)-1 {
-		value /= 1024
-		idx++
-	}
-	if idx == 0 {
-		return fmt.Sprintf("%d %s", n, sizes[idx])
-	}
-	return fmt.Sprintf("%.2f %s", value, sizes[idx])
 }

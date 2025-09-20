@@ -1,8 +1,11 @@
 package httpapi
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -93,7 +96,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 	ext := strings.ToLower(rawExt)
 	format, ok := extensionToFormat[ext]
 	if !ok {
-		h.respondError(c, http.StatusBadRequest, fmt.Errorf("unsupported extension %q", ext))
+		h.respondError(c, http.StatusUnsupportedMediaType, fmt.Errorf("unsupported extension %q", ext))
 		return
 	}
 	candidates := buildSourceCandidates(relative, rawExt)
@@ -241,17 +244,28 @@ func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format pro
 	}
 	defer file.Close()
 
-	etag := buildETag(info)
+	payload, err := io.ReadAll(file)
+	if err != nil {
+		return false
+	}
+	etag := buildContentETag(payload)
+	modTime := info.ModTime().UTC()
+
 	if matchETag(c.GetHeader("If-None-Match"), etag) {
+		c.Header("Cache-Control", cacheControlImmutable)
 		c.Header("ETag", etag)
+		c.Header("Last-Modified", modTime.Format(http.TimeFormat))
 		c.Status(http.StatusNotModified)
 		return true
 	}
+
 	ifModifiedSince := c.GetHeader("If-Modified-Since")
 	if ifModifiedSince != "" {
 		if t, err := http.ParseTime(ifModifiedSince); err == nil {
-			if !info.ModTime().After(t) {
-				c.Header("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
+			if !modTime.After(t.UTC()) {
+				c.Header("Cache-Control", cacheControlImmutable)
+				c.Header("ETag", etag)
+				c.Header("Last-Modified", modTime.Format(http.TimeFormat))
 				c.Status(http.StatusNotModified)
 				return true
 			}
@@ -259,10 +273,11 @@ func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format pro
 	}
 
 	c.Header("Content-Type", formatContentType[format])
-	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("Cache-Control", cacheControlImmutable)
 	c.Header("ETag", etag)
-	c.Header("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
-	http.ServeContent(c.Writer, c.Request, filepath.Base(cachePath), info.ModTime(), file)
+	c.Header("Last-Modified", modTime.Format(http.TimeFormat))
+	c.Header("Content-Length", strconv.Itoa(len(payload)))
+	c.Data(http.StatusOK, formatContentType[format], payload)
 	return true
 }
 
@@ -272,7 +287,12 @@ func (h *Handler) respondError(c *gin.Context, code int, err error) {
 		slog.Int("status", code),
 		slog.String("geometry", c.Param("geometry")),
 		slog.String("path", c.Param("filepath")))
-	c.AbortWithStatusJSON(code, gin.H{"error": err.Error()})
+	title := fmt.Sprintf("%d %s", code, http.StatusText(code))
+	body := fmt.Sprintf("<html><head><title>%s</title></head>\n<body>\n<center><h1>%s</h1></center>\n<hr><center>FARS</center>\n</body></html> ", title, title)
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.Header("Cache-Control", "no-cache")
+	c.String(code, body)
+	c.Abort()
 }
 
 func parseGeometry(geometry string) (int, int, error) {
@@ -302,12 +322,11 @@ func parseDimension(raw string) (int, error) {
 	return value, nil
 }
 
-func buildETag(info os.FileInfo) string {
-	return buildETagFromParts(info.ModTime(), info.Size())
-}
+const cacheControlImmutable = "public, max-age=31536000, immutable, s-maxage=31536000"
 
-func buildETagFromParts(mod time.Time, size int64) string {
-	return fmt.Sprintf("\"%x-%x\"", mod.UnixNano(), size)
+func buildContentETag(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("\"%s\"", hex.EncodeToString(sum[:]))
 }
 
 func matchETag(header string, etag string) bool {
