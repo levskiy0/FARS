@@ -29,21 +29,18 @@ var (
 	errInvalidGeometryLimit = errors.New("resize max dimensions must be positive")
 	envPathLookup           = buildEnvPathLookup()
 	envShortcutLookup       = map[string]string{
-		"HOST":                   "server.host",
-		"PORT":                   "server.port",
-		"IMAGES_BASE_DIR":        "storage.base_dir",
-		"CACHE_DIR":              "storage.cache_dir",
-		"MAX_WIDTH":              "resize.max_width",
-		"MAX_HEIGHT":             "resize.max_height",
-		"JPG_QUALITY":            "resize.jpg_quality",
-		"WEBP_QUALITY":           "resize.webp_quality",
-		"AVIF_QUALITY":           "resize.avif_quality",
-		"PNG_COMPRESSION":        "resize.png_compression",
-		"TTL":                    "cache.ttl",
-		"CLEANUP_INTERVAL":       "cache.cleanup_interval",
-		"MEMORY_CACHE_SIZE":      "cache.memory_cache_size",
-		"MAX_MEMORY_CHUNK":       "cache.max_memory_chunk",
-		"STORAGE_HOT_CACHE_SIZE": "cache.storage_hot_cache_size",
+		"HOST":             "server.host",
+		"PORT":             "server.port",
+		"IMAGES_BASE_DIR":  "storage.base_dir",
+		"CACHE_DIR":        "storage.cache_dir",
+		"MAX_WIDTH":        "resize.max_width",
+		"MAX_HEIGHT":       "resize.max_height",
+		"JPG_QUALITY":      "resize.jpg_quality",
+		"WEBP_QUALITY":     "resize.webp_quality",
+		"AVIF_QUALITY":     "resize.avif_quality",
+		"PNG_COMPRESSION":  "resize.png_compression",
+		"TTL":              "cache.ttl",
+		"CLEANUP_INTERVAL": "cache.cleanup_interval",
 	}
 )
 
@@ -85,11 +82,8 @@ type ResizeConfig struct {
 
 // CacheConfig stores cache retention settings.
 type CacheConfig struct {
-	TTL                 Duration `yaml:"ttl"`
-	CleanupInterval     Duration `yaml:"cleanup_interval"`
-	MemoryCacheSize     ByteSize `yaml:"memory_cache_size"`
-	MaxMemoryChunk      ByteSize `yaml:"max_memory_chunk"`
-	StorageHotCacheSize ByteSize `yaml:"storage_hot_cache_size"`
+	TTL             Duration `yaml:"ttl"`
+	CleanupInterval Duration `yaml:"cleanup_interval"`
 }
 
 // Duration wraps time.Duration to support YAML strings like "30d".
@@ -379,9 +373,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Resize.PNGCompression < 0 || c.Resize.PNGCompression > 9 {
 		return fmt.Errorf("resize.png_compression must be within 0-9, got %d", c.Resize.PNGCompression)
-	}
-	if c.Cache.MemoryCacheSize.Bytes > 0 && c.Cache.MaxMemoryChunk.Bytes > c.Cache.MemoryCacheSize.Bytes {
-		return fmt.Errorf("cache.max_memory_chunk (%d) cannot exceed cache.memory_cache_size (%d)", c.Cache.MaxMemoryChunk.Bytes, c.Cache.MemoryCacheSize.Bytes)
 	}
 	return nil
 }

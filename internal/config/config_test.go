@@ -57,10 +57,6 @@ func TestLoadFromEnvOrFileLegacyEnv(t *testing.T) {
 	t.Setenv("PNG_COMPRESSION", "4")
 	t.Setenv("TTL", "24h")
 	t.Setenv("CLEANUP_INTERVAL", "10m")
-	t.Setenv("MEMORY_CACHE_SIZE", "256mb")
-	t.Setenv("MAX_MEMORY_CHUNK", "512kb")
-	t.Setenv("STORAGE_HOT_CACHE_SIZE", "128mb")
-
 	cfg, err := LoadFromEnvOrFile("")
 	if err != nil {
 		t.Fatalf("LoadFromEnvOrFile: %v", err)
@@ -89,15 +85,6 @@ func TestLoadFromEnvOrFileLegacyEnv(t *testing.T) {
 	if cfg.Cache.CleanupInterval.Duration != 10*time.Minute {
 		t.Fatalf("unexpected cleanup interval: %s", cfg.Cache.CleanupInterval)
 	}
-	if cfg.Cache.MemoryCacheSize.Bytes != 256<<20 {
-		t.Fatalf("unexpected memory cache size: %d", cfg.Cache.MemoryCacheSize.Bytes)
-	}
-	if cfg.Cache.MaxMemoryChunk.Bytes != 512<<10 {
-		t.Fatalf("unexpected max memory chunk: %d", cfg.Cache.MaxMemoryChunk.Bytes)
-	}
-	if cfg.Cache.StorageHotCacheSize.Bytes != 128<<20 {
-		t.Fatalf("unexpected hot cache size: %d", cfg.Cache.StorageHotCacheSize.Bytes)
-	}
 }
 
 func TestLoadFromEnvOrFileWithPrefixedKeys(t *testing.T) {
@@ -110,9 +97,6 @@ func TestLoadFromEnvOrFileWithPrefixedKeys(t *testing.T) {
 	t.Setenv("FARS_STORAGE__CACHE_DIR", cacheDir)
 	t.Setenv("FARS_CACHE__TTL", "36h")
 	t.Setenv("FARS_CACHE__CLEANUP_INTERVAL", "30m")
-	t.Setenv("FARS_CACHE__MEMORY_CACHE_SIZE", "64mb")
-	t.Setenv("FARS_CACHE__MAX_MEMORY_CHUNK", "256kb")
-	t.Setenv("FARS_CACHE__STORAGE_HOT_CACHE_SIZE", "32mb")
 	t.Setenv("FARS_RESIZE__MAX_WIDTH", "1800")
 	t.Setenv("FARS_RESIZE__MAX_HEIGHT", "900")
 
@@ -131,15 +115,6 @@ func TestLoadFromEnvOrFileWithPrefixedKeys(t *testing.T) {
 	}
 	if cfg.Cache.CleanupInterval.Duration != 30*time.Minute {
 		t.Fatalf("unexpected cleanup interval: %s", cfg.Cache.CleanupInterval)
-	}
-	if cfg.Cache.MemoryCacheSize.Bytes != 64<<20 {
-		t.Fatalf("unexpected memory cache size: %d", cfg.Cache.MemoryCacheSize.Bytes)
-	}
-	if cfg.Cache.MaxMemoryChunk.Bytes != 256<<10 {
-		t.Fatalf("unexpected max memory chunk: %d", cfg.Cache.MaxMemoryChunk.Bytes)
-	}
-	if cfg.Cache.StorageHotCacheSize.Bytes != 32<<20 {
-		t.Fatalf("unexpected hot cache size: %d", cfg.Cache.StorageHotCacheSize.Bytes)
 	}
 	if cfg.Resize.MaxWidth != 1800 || cfg.Resize.MaxHeight != 900 {
 		t.Fatalf("unexpected resize limits: %+v", cfg.Resize)
@@ -219,7 +194,7 @@ rewrites:
 	}
 }
 
-func TestCacheMemorySettingsFromYAML(t *testing.T) {
+func TestCacheSettingsFromYAML(t *testing.T) {
 	base := t.TempDir()
 	cache := t.TempDir()
 	yamlConfig := fmt.Sprintf(`
@@ -239,22 +214,16 @@ resize:
 cache:
   ttl: "30d"
   cleanup_interval: "24h"
-  memory_cache_size: "300mb"
-  max_memory_chunk: "400kb"
-  storage_hot_cache_size: "100mb"
 `, filepath.ToSlash(base), filepath.ToSlash(cache))
 
 	cfg, err := LoadReader(strings.NewReader(yamlConfig))
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if got := cfg.Cache.MemoryCacheSize.Bytes; got != 300<<20 {
-		t.Fatalf("unexpected memory cache size: %d", got)
+	if cfg.Cache.TTL.Duration != 30*24*time.Hour {
+		t.Fatalf("unexpected ttl: %s", cfg.Cache.TTL)
 	}
-	if got := cfg.Cache.MaxMemoryChunk.Bytes; got != 400<<10 {
-		t.Fatalf("unexpected max memory chunk: %d", got)
-	}
-	if got := cfg.Cache.StorageHotCacheSize.Bytes; got != 100<<20 {
-		t.Fatalf("unexpected storage hot cache size: %d", got)
+	if cfg.Cache.CleanupInterval.Duration != 24*time.Hour {
+		t.Fatalf("unexpected cleanup interval: %s", cfg.Cache.CleanupInterval)
 	}
 }

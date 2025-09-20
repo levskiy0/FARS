@@ -17,9 +17,6 @@ resize:
 cache:
   ttl: "30d"
   cleanup_interval: "24h"
-  memory_cache_size: "300mb"
-  max_memory_chunk: "400kb"
-  storage_hot_cache_size: "100mb"
 
 rewrites:
   - pattern: "^(\\d)(-[\\w-]+)?/.+\\.jpg$"

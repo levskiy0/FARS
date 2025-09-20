@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"net/http"
@@ -143,12 +142,6 @@ func (h *Handler) handleResize(c *gin.Context) {
 	}
 
 	cachePath := h.cfg.CachePath(width, height, cacheRel)
-	if mem, ok := h.cache.LoadMemory(cachePath, originalInfo); ok {
-		if h.serveMemory(c, cachePath, format, mem) {
-			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start), nil)
-			return
-		}
-	}
 	if h.cache.IsFresh(cachePath, originalInfo) {
 		if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
 			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start), nil)
@@ -158,12 +151,6 @@ func (h *Handler) handleResize(c *gin.Context) {
 
 	release := h.locks.Lock(cachePath)
 	defer release()
-	if mem, ok := h.cache.LoadMemory(cachePath, originalInfo); ok {
-		if h.serveMemory(c, cachePath, format, mem) {
-			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start), nil)
-			return
-		}
-	}
 	if h.cache.IsFresh(cachePath, originalInfo) {
 		if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
 			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start), nil)
@@ -248,15 +235,11 @@ func (h *Handler) validateDimensions(width, height int) error {
 }
 
 func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format processor.Format, originalInfo os.FileInfo) bool {
-	if mem, ok := h.cache.LoadMemory(cachePath, originalInfo); ok {
-		return h.serveMemory(c, cachePath, format, mem)
-	}
 	info, file, err := h.cache.ServeFileStats(cachePath)
 	if err != nil {
 		return false
 	}
 	defer file.Close()
-	h.cache.MarkHot(cachePath, info.Size())
 
 	etag := buildETag(info)
 	if matchETag(c.GetHeader("If-None-Match"), etag) {
@@ -280,33 +263,6 @@ func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format pro
 	c.Header("ETag", etag)
 	c.Header("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
 	http.ServeContent(c.Writer, c.Request, filepath.Base(cachePath), info.ModTime(), file)
-	return true
-}
-
-func (h *Handler) serveMemory(c *gin.Context, cachePath string, format processor.Format, mem *cache.MemoryResult) bool {
-	reader := bytes.NewReader(mem.Payload)
-	etag := buildETagFromParts(mem.ModTime, mem.Size)
-	if matchETag(c.GetHeader("If-None-Match"), etag) {
-		c.Header("ETag", etag)
-		c.Status(http.StatusNotModified)
-		return true
-	}
-	ifModifiedSince := c.GetHeader("If-Modified-Since")
-	if ifModifiedSince != "" {
-		if t, err := http.ParseTime(ifModifiedSince); err == nil {
-			if !mem.ModTime.After(t) {
-				c.Header("Last-Modified", mem.ModTime.UTC().Format(http.TimeFormat))
-				c.Status(http.StatusNotModified)
-				return true
-			}
-		}
-	}
-
-	c.Header("Content-Type", formatContentType[format])
-	c.Header("Cache-Control", "public, max-age=31536000, immutable")
-	c.Header("ETag", etag)
-	c.Header("Last-Modified", mem.ModTime.UTC().Format(http.TimeFormat))
-	http.ServeContent(c.Writer, c.Request, filepath.Base(cachePath), mem.ModTime, reader)
 	return true
 }
 

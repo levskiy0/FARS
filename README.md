@@ -78,9 +78,6 @@ resize:
 cache:
   ttl: "30d"
   cleanup_interval: "24h"
-  memory_cache_size: "300mb"
-  max_memory_chunk: "400kb"
-  storage_hot_cache_size: "100mb"
 
 rewrites:
   - pattern: "^(\\d)(-[\\w-]+)?/.+\\.jpg$"
@@ -103,8 +100,7 @@ Every option in the YAML can be supplied through environment variables. Two nami
 - **Scoped** – prefix with `FARS_` and join nested keys with double underscores. Examples:
   - `FARS_SERVER__PORT=8080`
   - `FARS_STORAGE__BASE_DIR=/srv/images`
-  - `FARS_CACHE__MEMORY_CACHE_SIZE=512mb`
-- **Legacy shortcuts** (kept for existing deployments): `PORT`, `IMAGES_BASE_DIR`, `CACHE_DIR`, `TTL`, `CLEANUP_INTERVAL`, `MEMORY_CACHE_SIZE`, `MAX_MEMORY_CHUNK`, `STORAGE_HOT_CACHE_SIZE`, plus the resize quality/limit keys.
+- **Legacy shortcuts** (kept for existing deployments): `PORT`, `IMAGES_BASE_DIR`, `CACHE_DIR`, `TTL`, `CLEANUP_INTERVAL`, plus the resize quality/limit keys.
 
 Environment values override both the built-in defaults and anything read from YAML. Duration strings support the same syntax as the config file (`36h`, `15m30s`), and byte sizes accept units like `512kb`, `2mb`, `1giB`.
 
