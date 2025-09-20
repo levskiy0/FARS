@@ -7,17 +7,44 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/knadh/koanf"
+	yamlparser "github.com/knadh/koanf/parsers/yaml"
+	"github.com/knadh/koanf/providers/env"
+	"github.com/knadh/koanf/providers/file"
+	"github.com/knadh/koanf/providers/rawbytes"
+	"github.com/knadh/koanf/providers/structs"
+	"github.com/mitchellh/mapstructure"
 	"gopkg.in/yaml.v3"
+
+	"fars/pkg/configutil"
 )
 
 var (
 	errEmptyConfigPath      = errors.New("config path is empty")
 	errInvalidGeometryLimit = errors.New("resize max dimensions must be positive")
+	envPathLookup           = buildEnvPathLookup()
+	envShortcutLookup       = map[string]string{
+		"HOST":                   "server.host",
+		"PORT":                   "server.port",
+		"IMAGES_BASE_DIR":        "storage.base_dir",
+		"CACHE_DIR":              "storage.cache_dir",
+		"MAX_WIDTH":              "resize.max_width",
+		"MAX_HEIGHT":             "resize.max_height",
+		"JPG_QUALITY":            "resize.jpg_quality",
+		"WEBP_QUALITY":           "resize.webp_quality",
+		"AVIF_QUALITY":           "resize.avif_quality",
+		"PNG_COMPRESSION":        "resize.png_compression",
+		"TTL":                    "cache.ttl",
+		"CLEANUP_INTERVAL":       "cache.cleanup_interval",
+		"MEMORY_CACHE_SIZE":      "cache.memory_cache_size",
+		"MAX_MEMORY_CHUNK":       "cache.max_memory_chunk",
+		"STORAGE_HOT_CACHE_SIZE": "cache.storage_hot_cache_size",
+	}
 )
 
 // Config represents the full service configuration loaded from YAML.
@@ -106,18 +133,24 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	if value == nil {
 		return nil
 	}
-	var raw string
-	switch value.Kind {
-	case yaml.ScalarNode:
-		raw = strings.TrimSpace(value.Value)
-	default:
+	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf("duration must be a string, got kind %d", value.Kind)
 	}
-	if raw == "" || strings.EqualFold(raw, "null") {
+	return d.parseFromString(value.Value)
+}
+
+// UnmarshalText allows decoding durations from koanf/env providers.
+func (d *Duration) UnmarshalText(text []byte) error {
+	return d.parseFromString(string(text))
+}
+
+func (d *Duration) parseFromString(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "null") {
 		d.Duration = 0
 		return nil
 	}
-	dur, err := parseFlexibleDuration(raw)
+	dur, err := configutil.ParseFlexibleDuration(trimmed)
 	if err != nil {
 		return err
 	}
@@ -133,12 +166,21 @@ func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf("byte size must be a scalar, got kind %d", value.Kind)
 	}
-	raw := strings.TrimSpace(value.Value)
-	if raw == "" || strings.EqualFold(raw, "null") {
+	return b.parseFromString(value.Value)
+}
+
+// UnmarshalText allows decoding byte sizes from koanf/env providers.
+func (b *ByteSize) UnmarshalText(text []byte) error {
+	return b.parseFromString(string(text))
+}
+
+func (b *ByteSize) parseFromString(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "null") {
 		b.Bytes = 0
 		return nil
 	}
-	size, err := parseByteSize(raw)
+	size, err := configutil.ParseByteSize(trimmed)
 	if err != nil {
 		return err
 	}
@@ -169,12 +211,7 @@ func Load(path string) (*Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errEmptyConfigPath
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open config: %w", err)
-	}
-	defer file.Close()
-	return LoadReader(file)
+	return loadConfig(path, nil, false)
 }
 
 // LoadReader decodes configuration from an arbitrary reader.
@@ -183,9 +220,49 @@ func LoadReader(r io.Reader) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	return loadConfig("", data, false)
+}
+
+// LoadFromEnvOrFile loads configuration from YAML if path is provided;
+// otherwise starts from defaultConfig(). Env vars (if present) override both.
+func LoadFromEnvOrFile(path string) (*Config, error) {
+	return loadConfig(path, nil, true)
+}
+
+func loadConfig(path string, raw []byte, allowMissing bool) (*Config, error) {
+	k := koanf.New(".")
+	if err := k.Load(structs.Provider(*defaultConfig(), "yaml"), nil); err != nil {
+		return nil, fmt.Errorf("load defaults: %w", err)
+	}
+	sourcePath := strings.TrimSpace(path)
+	switch {
+	case len(raw) > 0:
+		if err := k.Load(rawbytes.Provider(raw), yamlparser.Parser()); err != nil {
+			return nil, fmt.Errorf("decode config: %w", err)
+		}
+	case sourcePath != "":
+		if err := k.Load(file.Provider(sourcePath), yamlparser.Parser()); err != nil {
+			return nil, fmt.Errorf("load config: %w", err)
+		}
+	case !allowMissing:
+		return nil, errEmptyConfigPath
+	}
+	if err := loadEnvVars(k); err != nil {
+		return nil, err
+	}
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("decode config: %w", err)
+	if err := k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{
+		Tag: "yaml",
+		DecoderConfig: &mapstructure.DecoderConfig{
+			TagName:          "yaml",
+			WeaklyTypedInput: true,
+			Result:           &cfg,
+			DecodeHook: mapstructure.ComposeDecodeHookFunc(
+				mapstructure.TextUnmarshallerHookFunc(),
+			),
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
 	if err := cfg.compile(); err != nil {
 		return nil, err
@@ -193,102 +270,79 @@ func LoadReader(r io.Reader) (*Config, error) {
 	return &cfg, cfg.Validate()
 }
 
-// ApplyEnvOverrides updates configuration fields from environment variables if they are set.
-// Recognized variables:
-//
-//	PORT                -> Server.Port (int)
-//	IMAGES_BASE_DIR     -> Storage.BaseDir
-//	CACHE_DIR           -> Storage.CacheDir
-//	TTL                 -> Cache.TTL (Go duration string, e.g. "24h", "30m")
-//	CLEANUP_INTERVAL    -> Cache.CleanupInterval (Go duration string, e.g. "10m")
-//	MEMORY_CACHE_SIZE   -> Cache.MemoryCacheSize (e.g. "300mb", "1gb")
-//	MAX_MEMORY_CHUNK    -> Cache.MaxMemoryChunk (e.g. "512kb")
-//	STORAGE_HOT_CACHE_SIZE -> Cache.StorageHotCacheSize (e.g. "100mb")
-func (c *Config) ApplyEnvOverrides() error {
-	// Ensure non-nil receiver
-	if c == nil {
-		return errors.New("nil config")
-	}
-	// Helper to get and trim
-	get := func(key string) string { return strings.TrimSpace(os.Getenv(key)) }
-
-	if v := strings.TrimSpace(get("PORT")); v != "" {
-		p, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("parse PORT=%q: %w", v, err)
+func loadEnvVars(k *koanf.Koanf) error {
+	for _, prefix := range []string{"FARS_", ""} {
+		if err := k.Load(env.Provider(prefix, ".", canonicalEnvKey), nil); err != nil {
+			return fmt.Errorf("load env: %w", err)
 		}
-		c.Server.Port = p
-	}
-	// Default host inside containers if empty
-	if strings.TrimSpace(c.Server.Host) == "" {
-		c.Server.Host = "0.0.0.0"
-	}
-	if v := get("IMAGES_BASE_DIR"); v != "" {
-		c.Storage.BaseDir = v
-	}
-	if v := get("CACHE_DIR"); v != "" {
-		c.Storage.CacheDir = v
-	}
-	if v := get("TTL"); v != "" {
-		d, err := parseFlexibleDuration(v)
-		if err != nil {
-			return fmt.Errorf("parse TTL=%q: %w", v, err)
-		}
-		c.Cache.TTL = Duration{d}
-	}
-	if v := get("CLEANUP_INTERVAL"); v != "" {
-		d, err := parseFlexibleDuration(v)
-		if err != nil {
-			return fmt.Errorf("parse CLEANUP_INTERVAL=%q: %w", v, err)
-		}
-		c.Cache.CleanupInterval = Duration{d}
-	}
-	if v := get("MEMORY_CACHE_SIZE"); v != "" {
-		size, err := parseByteSize(v)
-		if err != nil {
-			return fmt.Errorf("parse MEMORY_CACHE_SIZE=%q: %w", v, err)
-		}
-		c.Cache.MemoryCacheSize = ByteSize{Bytes: size}
-	}
-	if v := get("MAX_MEMORY_CHUNK"); v != "" {
-		size, err := parseByteSize(v)
-		if err != nil {
-			return fmt.Errorf("parse MAX_MEMORY_CHUNK=%q: %w", v, err)
-		}
-		c.Cache.MaxMemoryChunk = ByteSize{Bytes: size}
-	}
-	if v := get("STORAGE_HOT_CACHE_SIZE"); v != "" {
-		size, err := parseByteSize(v)
-		if err != nil {
-			return fmt.Errorf("parse STORAGE_HOT_CACHE_SIZE=%q: %w", v, err)
-		}
-		c.Cache.StorageHotCacheSize = ByteSize{Bytes: size}
 	}
 	return nil
 }
 
-// LoadFromEnvOrFile loads configuration from YAML if path is provided;
-// otherwise starts from defaultConfig(). Env vars (if present) override both.
-func LoadFromEnvOrFile(path string) (*Config, error) {
-	var (
-		cfg *Config
-		err error
-	)
-	if strings.TrimSpace(path) != "" {
-		cfg, err = Load(path)
-		if err != nil {
-			return nil, err
+func canonicalEnvKey(key string) string {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "FARS_") {
+		trimmed = strings.TrimPrefix(trimmed, "FARS_")
+	}
+	if strings.Contains(trimmed, "__") {
+		lower := strings.ToLower(trimmed)
+		return strings.ReplaceAll(lower, "__", ".")
+	}
+	upper := strings.ToUpper(trimmed)
+	if mapped, ok := envShortcutLookup[upper]; ok {
+		return mapped
+	}
+	if mapped, ok := envPathLookup[upper]; ok {
+		return mapped
+	}
+	return ""
+}
+
+func buildEnvPathLookup() map[string]string {
+	result := make(map[string]string)
+	var walk func(reflect.Type, []string)
+	walk = func(t reflect.Type, path []string) {
+		if t.Kind() == reflect.Pointer {
+			t = t.Elem()
 		}
-	} else {
-		cfg = defaultConfig()
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if field.PkgPath != "" {
+				continue
+			}
+			name := field.Tag.Get("yaml")
+			if name == "" || name == "-" {
+				name = strings.ToLower(field.Name)
+			} else {
+				name = strings.Split(name, ",")[0]
+			}
+			if name == "" || name == "-" {
+				continue
+			}
+			current := append(append([]string{}, path...), name)
+			typ := field.Type
+			base := typ
+			for base.Kind() == reflect.Pointer {
+				base = base.Elem()
+			}
+			switch base.Kind() {
+			case reflect.Struct:
+				if base != reflect.TypeOf(Duration{}) && base != reflect.TypeOf(ByteSize{}) && base != reflect.TypeOf(time.Time{}) {
+					walk(base, current)
+					continue
+				}
+			case reflect.Slice, reflect.Map, reflect.Array:
+				continue
+			}
+			key := strings.ToUpper(strings.Join(current, "_"))
+			result[key] = strings.Join(current, ".")
+		}
 	}
-	if err := cfg.ApplyEnvOverrides(); err != nil {
-		return nil, err
-	}
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	return cfg, nil
+	walk(reflect.TypeOf(Config{}), nil)
+	return result
 }
 
 // Validate returns an error if required configuration values are missing or invalid.
@@ -377,97 +431,6 @@ func ensureDirExists(path string) error {
 		return fmt.Errorf("path %s is not a directory", sanitized)
 	}
 	return nil
-}
-
-var (
-	durationPattern = regexp.MustCompile(`(?i)^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$`)
-	byteSizePattern = regexp.MustCompile(`(?i)^\s*(\d+)\s*([kmgtp]?i?b?)?\s*$`)
-)
-
-func parseFlexibleDuration(raw string) (time.Duration, error) {
-	matches := durationPattern.FindStringSubmatch(raw)
-	if matches == nil {
-		return 0, fmt.Errorf("invalid duration %q", raw)
-	}
-	var total time.Duration
-	if matches[1] != "" {
-		days, err := strconv.Atoi(matches[1])
-		if err != nil {
-			return 0, fmt.Errorf("parse duration days %q: %w", matches[1], err)
-		}
-		total += time.Duration(days) * 24 * time.Hour
-	}
-	if matches[2] != "" {
-		hours, err := time.ParseDuration(matches[2] + "h")
-		if err != nil {
-			return 0, err
-		}
-		total += hours
-	}
-	if matches[3] != "" {
-		mins, err := time.ParseDuration(matches[3] + "m")
-		if err != nil {
-			return 0, err
-		}
-		total += mins
-	}
-	if matches[4] != "" {
-		secs, err := time.ParseDuration(matches[4] + "s")
-		if err != nil {
-			return 0, err
-		}
-		total += secs
-	}
-	return total, nil
-}
-
-func parseByteSize(raw string) (int64, error) {
-	clean := strings.TrimSpace(raw)
-	if clean == "" {
-		return 0, nil
-	}
-	matches := byteSizePattern.FindStringSubmatch(clean)
-	if matches == nil {
-		return 0, fmt.Errorf("invalid size %q", raw)
-	}
-	value, err := strconv.ParseInt(matches[1], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse size %q: %w", matches[1], err)
-	}
-	unit := strings.ToLower(strings.TrimSpace(matches[2]))
-	if unit == "" || unit == "b" {
-		return value, nil
-	}
-	multiplier, ok := sizeMultiplier(unit)
-	if !ok {
-		return 0, fmt.Errorf("unknown size unit %q", matches[2])
-	}
-	if value < 0 {
-		return 0, fmt.Errorf("size must be non-negative, got %d", value)
-	}
-	if value > 0 && multiplier > 0 && value > maxInt64/multiplier {
-		return 0, fmt.Errorf("size %q overflows", raw)
-	}
-	return value * multiplier, nil
-}
-
-const maxInt64 = int64(^uint64(0) >> 1)
-
-func sizeMultiplier(unit string) (int64, bool) {
-	switch unit {
-	case "k", "kb", "kib":
-		return 1 << 10, true
-	case "m", "mb", "mib":
-		return 1 << 20, true
-	case "g", "gb", "gib":
-		return 1 << 30, true
-	case "t", "tb", "tib":
-		return 1 << 40, true
-	case "p", "pb", "pib":
-		return 1 << 50, true
-	default:
-		return 0, false
-	}
 }
 
 // ResolveOriginalPath resolves a request path against base dir ensuring no traversal.

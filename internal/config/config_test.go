@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"fars/pkg/configutil"
 )
 
 func TestParseByteSize(t *testing.T) {
@@ -22,7 +24,7 @@ func TestParseByteSize(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
-			size, err := parseByteSize(tc.input)
+			size, err := configutil.ParseByteSize(tc.input)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -34,8 +36,113 @@ func TestParseByteSize(t *testing.T) {
 }
 
 func TestParseByteSizeInvalid(t *testing.T) {
-	if _, err := parseByteSize("12foobar"); err == nil {
+	if _, err := configutil.ParseByteSize("12foobar"); err == nil {
 		t.Fatalf("expected error for invalid unit")
+	}
+}
+
+func TestLoadFromEnvOrFileLegacyEnv(t *testing.T) {
+	baseDir := t.TempDir()
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+
+	t.Setenv("HOST", "127.0.0.1")
+	t.Setenv("PORT", "9091")
+	t.Setenv("IMAGES_BASE_DIR", baseDir)
+	t.Setenv("CACHE_DIR", cacheDir)
+	t.Setenv("MAX_WIDTH", "1500")
+	t.Setenv("MAX_HEIGHT", "800")
+	t.Setenv("JPG_QUALITY", "90")
+	t.Setenv("WEBP_QUALITY", "88")
+	t.Setenv("AVIF_QUALITY", "55")
+	t.Setenv("PNG_COMPRESSION", "4")
+	t.Setenv("TTL", "24h")
+	t.Setenv("CLEANUP_INTERVAL", "10m")
+	t.Setenv("MEMORY_CACHE_SIZE", "256mb")
+	t.Setenv("MAX_MEMORY_CHUNK", "512kb")
+	t.Setenv("STORAGE_HOT_CACHE_SIZE", "128mb")
+
+	cfg, err := LoadFromEnvOrFile("")
+	if err != nil {
+		t.Fatalf("LoadFromEnvOrFile: %v", err)
+	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Fatalf("unexpected host: %s", cfg.Server.Host)
+	}
+	if cfg.Server.Port != 9091 {
+		t.Fatalf("unexpected port: %d", cfg.Server.Port)
+	}
+	if cfg.Storage.BaseDir != baseDir {
+		t.Fatalf("unexpected base dir: %s", cfg.Storage.BaseDir)
+	}
+	if cfg.Storage.CacheDir != cacheDir {
+		t.Fatalf("unexpected cache dir: %s", cfg.Storage.CacheDir)
+	}
+	if cfg.Resize.MaxWidth != 1500 || cfg.Resize.MaxHeight != 800 {
+		t.Fatalf("unexpected resize limits: %+v", cfg.Resize)
+	}
+	if cfg.Resize.JPGQuality != 90 || cfg.Resize.WebPQuality != 88 || cfg.Resize.AVIFQuality != 55 || cfg.Resize.PNGCompression != 4 {
+		t.Fatalf("unexpected resize quality settings: %+v", cfg.Resize)
+	}
+	if cfg.Cache.TTL.Duration != 24*time.Hour {
+		t.Fatalf("unexpected cache TTL: %s", cfg.Cache.TTL)
+	}
+	if cfg.Cache.CleanupInterval.Duration != 10*time.Minute {
+		t.Fatalf("unexpected cleanup interval: %s", cfg.Cache.CleanupInterval)
+	}
+	if cfg.Cache.MemoryCacheSize.Bytes != 256<<20 {
+		t.Fatalf("unexpected memory cache size: %d", cfg.Cache.MemoryCacheSize.Bytes)
+	}
+	if cfg.Cache.MaxMemoryChunk.Bytes != 512<<10 {
+		t.Fatalf("unexpected max memory chunk: %d", cfg.Cache.MaxMemoryChunk.Bytes)
+	}
+	if cfg.Cache.StorageHotCacheSize.Bytes != 128<<20 {
+		t.Fatalf("unexpected hot cache size: %d", cfg.Cache.StorageHotCacheSize.Bytes)
+	}
+}
+
+func TestLoadFromEnvOrFileWithPrefixedKeys(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "prefixed-base")
+	cacheDir := filepath.Join(t.TempDir(), "prefixed-cache")
+
+	t.Setenv("FARS_SERVER__HOST", "0.0.0.0")
+	t.Setenv("FARS_SERVER__PORT", "8085")
+	t.Setenv("FARS_STORAGE__BASE_DIR", baseDir)
+	t.Setenv("FARS_STORAGE__CACHE_DIR", cacheDir)
+	t.Setenv("FARS_CACHE__TTL", "36h")
+	t.Setenv("FARS_CACHE__CLEANUP_INTERVAL", "30m")
+	t.Setenv("FARS_CACHE__MEMORY_CACHE_SIZE", "64mb")
+	t.Setenv("FARS_CACHE__MAX_MEMORY_CHUNK", "256kb")
+	t.Setenv("FARS_CACHE__STORAGE_HOT_CACHE_SIZE", "32mb")
+	t.Setenv("FARS_RESIZE__MAX_WIDTH", "1800")
+	t.Setenv("FARS_RESIZE__MAX_HEIGHT", "900")
+
+	cfg, err := LoadFromEnvOrFile("")
+	if err != nil {
+		t.Fatalf("LoadFromEnvOrFile: %v", err)
+	}
+	if cfg.Server.Port != 8085 {
+		t.Fatalf("unexpected port: %d", cfg.Server.Port)
+	}
+	if cfg.Storage.BaseDir != baseDir || cfg.Storage.CacheDir != cacheDir {
+		t.Fatalf("unexpected storage config: %+v", cfg.Storage)
+	}
+	if cfg.Cache.TTL.Duration != 36*time.Hour {
+		t.Fatalf("unexpected ttl: %s", cfg.Cache.TTL)
+	}
+	if cfg.Cache.CleanupInterval.Duration != 30*time.Minute {
+		t.Fatalf("unexpected cleanup interval: %s", cfg.Cache.CleanupInterval)
+	}
+	if cfg.Cache.MemoryCacheSize.Bytes != 64<<20 {
+		t.Fatalf("unexpected memory cache size: %d", cfg.Cache.MemoryCacheSize.Bytes)
+	}
+	if cfg.Cache.MaxMemoryChunk.Bytes != 256<<10 {
+		t.Fatalf("unexpected max memory chunk: %d", cfg.Cache.MaxMemoryChunk.Bytes)
+	}
+	if cfg.Cache.StorageHotCacheSize.Bytes != 32<<20 {
+		t.Fatalf("unexpected hot cache size: %d", cfg.Cache.StorageHotCacheSize.Bytes)
+	}
+	if cfg.Resize.MaxWidth != 1800 || cfg.Resize.MaxHeight != 900 {
+		t.Fatalf("unexpected resize limits: %+v", cfg.Resize)
 	}
 }
 
@@ -51,7 +158,7 @@ func TestParseFlexibleDuration(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			dur, err := parseFlexibleDuration(tt.input)
+			dur, err := configutil.ParseFlexibleDuration(tt.input)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
