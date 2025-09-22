@@ -124,9 +124,9 @@ func defaultConfig() *Config {
 			MaxHeight:      2000,
 			JPGQuality:     80,
 			WebPQuality:    75,
-			AVIFQuality:    45,
+			AVIFQuality:    75,
 			PNGCompression: 6,
-			AVIFSpeed:      0,
+			AVIFSpeed:      8,
 		},
 		Cache: CacheConfig{
 			TTL:             Duration{30 * 24 * time.Hour}, // 30d
