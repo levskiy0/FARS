@@ -176,9 +176,6 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			m.logger.Warn("remove cache dir", slog.String("path", dir), slog.Any("error", err))
 		}
 	}
-	if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
-		m.logger.Warn("remove cache root", slog.String("path", root), slog.Any("error", err))
-	}
 	m.logger.Info("cache cleanup finished",
 		slog.Int("files_removed", stats.files),
 		slog.String("bytes_removed", human.FormatBytes(stats.bytes)),

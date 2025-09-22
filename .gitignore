@@ -1,15 +1,20 @@
-.idea
-.DS_Store
-build
-test
+# Ignore everything inside data/cache but keep the folder
+data/cache/*
+!data/cache/.gitkeep
 
+# Ignore everything inside data/images but keep the folder
+data/images/*
+!data/images/.gitkeep
+
+# Other ignores
+.DS_Store
+.gocache
+.idea
+AGENTS.md
+build
 config.yaml
 fars
-
-AGENTS.md
 specs
 temp
-
-.gocache
-
+test
 test.sh
