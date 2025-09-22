@@ -1,8 +1,5 @@
 FROM golang:1.24-alpine AS builder
-# RUN apk add --no-cache vips-dev
-# RUN apk add --no-cache build-base vips-dev vips-heif pkgconfig
-RUN apk add --no-cache --virtual .build-deps \
-      build-base pkgconfig vips-dev libheif-dev
+RUN apk add --no-cache build-base vips-dev vips-heif pkgconfig
 ENV CGO_ENABLED=1 \
     GO111MODULE=on
 WORKDIR /app
@@ -23,7 +20,6 @@ FROM alpine:3.22
 WORKDIR /app
 RUN apk add --no-cache vips vips-heif && \
     rm -rf /var/cache/apk/*  && \
-    # adduser -s /sbin/nologin -D fars && \
     adduser -H -D -u 10001 -s /sbin/nologin fars && \
     mkdir -p /app/data/images /app/data/cache && \
     chown -R fars:fars /app
