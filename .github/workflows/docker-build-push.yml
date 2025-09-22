@@ -3,10 +3,6 @@ name: Build & Push Images
 on:
   push:
     branches: [ main ]
-    paths:
-      - "Dockerfile"
-      - "Dockerfile.*"
-      - ".github/workflows/**"
   workflow_dispatch:
 
 
