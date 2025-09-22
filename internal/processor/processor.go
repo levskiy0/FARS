@@ -56,9 +56,44 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 	}
 	switch {
 	case opts.Width > 0 && opts.Height > 0:
-		if opts.Width > size.Width && opts.Height > size.Height {
-			return p.resizeWithCanvas(img, opts)
+		widthRatio := float64(opts.Width) / float64(size.Width)
+		heightRatio := float64(opts.Height) / float64(size.Height)
+		scale := math.Min(widthRatio, heightRatio)
+		if scale > 1 {
+			scale = 1
 		}
+		if scale < 1 {
+			contentWidth := int(math.Round(float64(size.Width) * scale))
+			if contentWidth < 1 {
+				contentWidth = 1
+			}
+			contentHeight := int(math.Round(float64(size.Height) * scale))
+			if contentHeight < 1 {
+				contentHeight = 1
+			}
+			limitByWidth := widthRatio <= heightRatio
+			stageWidth := 0
+			stageHeight := 0
+			if limitByWidth {
+				stageWidth = contentWidth
+			} else {
+				stageHeight = contentHeight
+			}
+			stage, err := img.Process(bimg.Options{
+				Type:          bimg.PNG,
+				StripMetadata: true,
+				NoAutoRotate:  false,
+				Width:         stageWidth,
+				Height:        stageHeight,
+				Embed:         false,
+				Force:         true,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("shrink source: %w", err)
+			}
+			return p.renderCanvas(stage, opts)
+		}
+		return p.resizeWithCanvas(img, opts)
 	case opts.Width > 0 && opts.Height == 0:
 		if opts.Width > size.Width {
 			canvas := opts
@@ -87,8 +122,8 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 	options.Width = opts.Width
 	options.Height = opts.Height
 	if opts.Width > 0 && opts.Height > 0 {
-		options.Embed = false
-		options.Crop = true
+		options.Embed = true
+		options.Crop = false
 		options.Gravity = bimg.GravityCentre
 	}
 	result, err := img.Process(options)
@@ -109,6 +144,10 @@ func (p *Processor) resizeWithCanvas(img *bimg.Image, opts Options) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("prepare source for canvas: %w", err)
 	}
+	return p.renderCanvas(stage, opts)
+}
+
+func (p *Processor) renderCanvas(stage []byte, opts Options) ([]byte, error) {
 	decoded, err := png.Decode(bytes.NewReader(stage))
 	if err != nil {
 		return nil, fmt.Errorf("decode intermediate image: %w", err)

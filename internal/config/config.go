@@ -473,7 +473,7 @@ func (c *Config) CachePath(width, height int, relative string) string {
 	prefix := formatGeometryPrefix(width, height)
 	prepared := strings.TrimPrefix(relative, "/")
 	clean := filepath.Clean(prepared)
-	return filepath.Join(c.Storage.CacheDir, "resize", prefix, filepath.FromSlash(clean))
+	return filepath.Join(c.Storage.CacheDir, prefix, filepath.FromSlash(clean))
 }
 
 func formatGeometryPrefix(width, height int) string {

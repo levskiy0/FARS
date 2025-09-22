@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -184,21 +183,16 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 	return nil
 }
 
-var geometryPattern = regexp.MustCompile(`^(\d+x\d+|\d+x|x\d+|0x0)$`)
-
 func splitCachePath(cacheRoot, candidate string) (geometry string, rel string, ok bool) {
 	relPath, err := filepath.Rel(cacheRoot, candidate)
 	if err != nil {
 		return "", "", false
 	}
-	parts := strings.Split(filepath.ToSlash(relPath), "/")
-	if len(parts) < 2 || parts[0] != "resize" {
+	parts := strings.SplitN(filepath.ToSlash(relPath), "/", 2)
+	if len(parts) != 2 {
 		return "", "", false
 	}
-	if !geometryPattern.MatchString(parts[1]) {
-		return "", "", false
-	}
-	return parts[1], strings.Join(parts[2:], "/"), true
+	return parts[0], parts[1], true
 }
 
 type cleanupStats struct {

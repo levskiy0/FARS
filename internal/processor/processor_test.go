@@ -127,7 +127,7 @@ func diff(a, b uint8) uint8 {
 	return b - a
 }
 
-func TestResizeDownscaleRemovesBlackBorders(t *testing.T) {
+func TestResizeDownscaleFitsWithinCanvas(t *testing.T) {
 	srcWidth := 12
 	srcHeight := 6
 	src := image.NewNRGBA(image.Rect(0, 0, srcWidth, srcHeight))
@@ -159,15 +159,19 @@ func TestResizeDownscaleRemovesBlackBorders(t *testing.T) {
 	if bounds.Dx() != target || bounds.Dy() != target {
 		t.Fatalf("expected %dx%d, got %dx%d", target, target, bounds.Dx(), bounds.Dy())
 	}
-	for _, y := range []int{0, bounds.Dy() / 2, bounds.Dy() - 1} {
-		for x := 0; x < bounds.Dx(); x++ {
-			pixel := color.NRGBAModel.Convert(decoded.At(x, y)).(color.NRGBA)
-			if pixel.A != 255 {
-				t.Fatalf("expected opaque pixel at (%d,%d), got alpha=%d", x, y, pixel.A)
-			}
-			if diff(pixel.R, fill.R) > 5 || diff(pixel.G, fill.G) > 5 || diff(pixel.B, fill.B) > 5 {
-				t.Fatalf("expected fill color at (%d,%d), got %+v", x, y, pixel)
-			}
-		}
+	corner := color.NRGBAModel.Convert(decoded.At(0, 0)).(color.NRGBA)
+	if corner.A != 0 {
+		t.Fatalf("expected transparent padding at corner, got alpha=%d", corner.A)
+	}
+	center := color.NRGBAModel.Convert(decoded.At(bounds.Dx()/2, bounds.Dy()/2)).(color.NRGBA)
+	if center.A != 255 {
+		t.Fatalf("expected opaque center pixel, got alpha=%d", center.A)
+	}
+	if diff(center.R, fill.R) > 5 || diff(center.G, fill.G) > 5 || diff(center.B, fill.B) > 5 {
+		t.Fatalf("expected fill color at center, got %+v", center)
+	}
+	top := color.NRGBAModel.Convert(decoded.At(bounds.Dx()/2, 0)).(color.NRGBA)
+	if top.A != 0 {
+		t.Fatalf("expected transparent padding at top edge, got alpha=%d", top.A)
 	}
 }
