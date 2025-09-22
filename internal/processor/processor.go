@@ -30,6 +30,7 @@ type Options struct {
 	JPEGQuality    int
 	WebPQuality    int
 	AVIFQuality    int
+	AVIFSpeed      int
 	PNGCompression int
 	EnsureOpaque   bool
 }
@@ -171,6 +172,7 @@ func buildBaseOptions(opts Options) (bimg.Options, error) {
 	case FormatAVIF:
 		options.Type = bimg.AVIF
 		options.Quality = opts.AVIFQuality
+		options.Speed = opts.AVIFSpeed
 	default:
 		return bimg.Options{}, fmt.Errorf("unsupported format %q", opts.Format)
 	}

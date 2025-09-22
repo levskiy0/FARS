@@ -14,6 +14,9 @@ var (
 )
 
 func ParseFlexibleDuration(raw string) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "0" {
+		return 0, nil
+	}
 	matches := durationPattern.FindStringSubmatch(raw)
 	if matches == nil {
 		return 0, fmt.Errorf("invalid duration %q", raw)

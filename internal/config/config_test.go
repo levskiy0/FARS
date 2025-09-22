@@ -55,6 +55,9 @@ func TestLoadFromEnvOrFileLegacyEnv(t *testing.T) {
 	t.Setenv("WEBP_QUALITY", "88")
 	t.Setenv("AVIF_QUALITY", "55")
 	t.Setenv("PNG_COMPRESSION", "4")
+	t.Setenv("AVIF_SPEED", "6")
+	t.Setenv("GOMAXPROCS", "6")
+	t.Setenv("VIPS_CONCURRENCY", "5")
 	t.Setenv("TTL", "24h")
 	t.Setenv("CLEANUP_INTERVAL", "10m")
 	cfg, err := LoadFromEnvOrFile("")
@@ -79,11 +82,20 @@ func TestLoadFromEnvOrFileLegacyEnv(t *testing.T) {
 	if cfg.Resize.JPGQuality != 90 || cfg.Resize.WebPQuality != 88 || cfg.Resize.AVIFQuality != 55 || cfg.Resize.PNGCompression != 4 {
 		t.Fatalf("unexpected resize quality settings: %+v", cfg.Resize)
 	}
+	if cfg.Resize.AVIFSpeed != 6 {
+		t.Fatalf("unexpected avif speed: %d", cfg.Resize.AVIFSpeed)
+	}
 	if cfg.Cache.TTL.Duration != 24*time.Hour {
 		t.Fatalf("unexpected cache TTL: %s", cfg.Cache.TTL)
 	}
 	if cfg.Cache.CleanupInterval.Duration != 10*time.Minute {
 		t.Fatalf("unexpected cleanup interval: %s", cfg.Cache.CleanupInterval)
+	}
+	if cfg.Runtime.GOMAXPROCS != 6 {
+		t.Fatalf("unexpected GOMAXPROCS: %d", cfg.Runtime.GOMAXPROCS)
+	}
+	if cfg.Runtime.VIPSConcurrency != 5 {
+		t.Fatalf("unexpected vips concurrency: %d", cfg.Runtime.VIPSConcurrency)
 	}
 }
 
@@ -99,6 +111,9 @@ func TestLoadFromEnvOrFileWithPrefixedKeys(t *testing.T) {
 	t.Setenv("FARS_CACHE__CLEANUP_INTERVAL", "30m")
 	t.Setenv("FARS_RESIZE__MAX_WIDTH", "1800")
 	t.Setenv("FARS_RESIZE__MAX_HEIGHT", "900")
+	t.Setenv("FARS_RESIZE__AVIF_SPEED", "4")
+	t.Setenv("FARS_RUNTIME__GOMAXPROCS", "3")
+	t.Setenv("FARS_RUNTIME__VIPS_CONCURRENCY", "7")
 
 	cfg, err := LoadFromEnvOrFile("")
 	if err != nil {
@@ -119,6 +134,12 @@ func TestLoadFromEnvOrFileWithPrefixedKeys(t *testing.T) {
 	if cfg.Resize.MaxWidth != 1800 || cfg.Resize.MaxHeight != 900 {
 		t.Fatalf("unexpected resize limits: %+v", cfg.Resize)
 	}
+	if cfg.Resize.AVIFSpeed != 4 {
+		t.Fatalf("unexpected avif speed: %d", cfg.Resize.AVIFSpeed)
+	}
+	if cfg.Runtime.GOMAXPROCS != 3 || cfg.Runtime.VIPSConcurrency != 7 {
+		t.Fatalf("unexpected runtime config: %+v", cfg.Runtime)
+	}
 }
 
 func TestParseFlexibleDuration(t *testing.T) {
@@ -126,6 +147,7 @@ func TestParseFlexibleDuration(t *testing.T) {
 		input    string
 		expected time.Duration
 	}{
+		{"0", 0},
 		{"30d", 30 * 24 * time.Hour},
 		{"1d12h", (24 + 12) * time.Hour},
 		{"2h30m", 2*time.Hour + 30*time.Minute},

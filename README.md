@@ -74,11 +74,16 @@ resize:
   jpg_quality: 80
   webp_quality: 75
   avif_quality: 45
+  avif_speed: 6
   png_compression: 6
 
 cache:
   ttl: "30d"
   cleanup_interval: "24h"
+
+runtime:
+  gomaxprocs: 0
+  vips_concurrency: 0
 
 rewrites:
   - pattern: "^(\\d)(-[\\w-]+)?/.+\\.jpg$"
@@ -91,7 +96,9 @@ Key points:
 
 - `max_width` / `max_height` guard against excessive geometry. Requests beyond the limits return `400 Bad Request`.
 - `jpg_quality`, `webp_quality`, `avif_quality`, and `png_compression` feed directly into the libvips encoder settings.
-- `cache.ttl` and `cache.cleanup_interval` accept human-friendly durations (`30d`, `12h30m`, `45s`).
+- `avif_speed` passes through to the libheif AVIF encoder (0 = slowest/best, 8 = fastest).
+- `cache.ttl` and `cache.cleanup_interval` accept human-friendly durations (`30d`, `12h30m`, `45s`); use `"0"` for `cleanup_interval` to disable the background purge.
+- `runtime.gomaxprocs` and `runtime.vips_concurrency` allow tuning Go scheduler threads and libvips worker pool (0 keeps library defaults).
 - Rewrite rules are evaluated sequentially; the first matching pattern rewrites the path and stops the chain.
 
 ### Environment Overrides

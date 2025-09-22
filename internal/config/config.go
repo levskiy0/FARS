@@ -40,6 +40,9 @@ var (
 		"WEBP_QUALITY":     "resize.webp_quality",
 		"AVIF_QUALITY":     "resize.avif_quality",
 		"PNG_COMPRESSION":  "resize.png_compression",
+		"AVIF_SPEED":       "resize.avif_speed",
+		"GOMAXPROCS":       "runtime.gomaxprocs",
+		"VIPS_CONCURRENCY": "runtime.vips_concurrency",
 		"TTL":              "cache.ttl",
 		"CLEANUP_INTERVAL": "cache.cleanup_interval",
 	}
@@ -51,6 +54,7 @@ type Config struct {
 	Storage  StorageConfig `yaml:"storage"`
 	Resize   ResizeConfig  `yaml:"resize"`
 	Cache    CacheConfig   `yaml:"cache"`
+	Runtime  RuntimeConfig `yaml:"runtime"`
 	Rewrites []RewriteRule `yaml:"rewrites"`
 }
 
@@ -79,6 +83,13 @@ type ResizeConfig struct {
 	WebPQuality    int `yaml:"webp_quality"`
 	AVIFQuality    int `yaml:"avif_quality"`
 	PNGCompression int `yaml:"png_compression"`
+	AVIFSpeed      int `yaml:"avif_speed"`
+}
+
+// RuntimeConfig controls Go scheduler and libvips concurrency.
+type RuntimeConfig struct {
+	GOMAXPROCS      int `yaml:"gomaxprocs"`
+	VIPSConcurrency int `yaml:"vips_concurrency"`
 }
 
 // CacheConfig stores cache retention settings.
@@ -115,11 +126,13 @@ func defaultConfig() *Config {
 			WebPQuality:    75,
 			AVIFQuality:    45,
 			PNGCompression: 6,
+			AVIFSpeed:      0,
 		},
 		Cache: CacheConfig{
 			TTL:             Duration{30 * 24 * time.Hour}, // 30d
 			CleanupInterval: Duration{24 * time.Hour},      // 24h
 		},
+		Runtime: RuntimeConfig{},
 	}
 }
 
@@ -374,6 +387,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Resize.PNGCompression < 0 || c.Resize.PNGCompression > 9 {
 		return fmt.Errorf("resize.png_compression must be within 0-9, got %d", c.Resize.PNGCompression)
+	}
+	if c.Resize.AVIFSpeed < 0 || c.Resize.AVIFSpeed > 8 {
+		return fmt.Errorf("resize.avif_speed must be within 0-8, got %d", c.Resize.AVIFSpeed)
+	}
+	if c.Runtime.GOMAXPROCS < 0 {
+		return fmt.Errorf("runtime.gomaxprocs must be >= 0, got %d", c.Runtime.GOMAXPROCS)
+	}
+	if c.Runtime.VIPSConcurrency < 0 {
+		return fmt.Errorf("runtime.vips_concurrency must be >= 0, got %d", c.Runtime.VIPSConcurrency)
 	}
 	return nil
 }

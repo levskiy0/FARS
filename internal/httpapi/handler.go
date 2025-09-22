@@ -175,6 +175,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 		JPEGQuality:    h.cfg.Resize.JPGQuality,
 		WebPQuality:    h.cfg.Resize.WebPQuality,
 		AVIFQuality:    h.cfg.Resize.AVIFQuality,
+		AVIFSpeed:      h.cfg.Resize.AVIFSpeed,
 		PNGCompression: h.cfg.Resize.PNGCompression,
 		EnsureOpaque:   ensureOpaque,
 	})
