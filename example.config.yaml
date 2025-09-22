@@ -11,7 +11,7 @@ resize:
   max_height: 2000
   jpg_quality: 80
   webp_quality: 75
-  avif_quality: 50
+  avif_quality: 70
   avif_speed: 8
   png_compression: 6
 
