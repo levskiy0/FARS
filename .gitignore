@@ -4,11 +4,11 @@ data/cache/*
 data/images/*
 !data/images/.gitkeep
 
-# tests/cache/*
-# !tests/cache/.gitkeep
+tests/cache/*
+!tests/cache/.gitkeep
 
-# tests/images/*
-# !tests/images/.gitkeep
+tests/images/*
+!tests/images/.gitkeep
 
 # Other ignores
 .DS_Store
