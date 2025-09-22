@@ -133,13 +133,17 @@ docker build -t fars:latest .
 
 To run:
 ```bash
-docker run --rm -p 8080:8080 \
-  -e PORT=8080 \
-  -e IMAGES_BASE_DIR=/data/base \
-  -e CACHE_DIR=/data/cache \
+docker run --rm -p 9090:9090 \
+  -e PORT=9090 \
+  -e IMAGES_BASE_DIR=/app/data/images \
+  -e CACHE_DIR=/app/data/cache \
   -e TTL=24h \
   -e CLEANUP_INTERVAL=10m \
-  -v "$(pwd)/tests/images:/data/base" \
-  -v "$(pwd)/tests/cache:/data/cache" \
-  fars:latest
+  -v "./data/images:/app/data/images" \
+  -v "./data/cache:/app/data/cache" \
+  -v "./example.config.yaml:/app/config/example.config.yaml" \
+  fars:latest \
+  cmd --config /app/config/example.config.yaml
 ```
+
+  --entrypoint	"/app/fars serve --config /app/config/example.config.yaml" \
