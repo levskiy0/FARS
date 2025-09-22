@@ -20,7 +20,7 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/fars ./cmd/fars-server
 # Slim runtime with libvips
 FROM alpine:3.22
 WORKDIR /app
-RUN apk add --no-cache vips ca-certificates && \
+RUN apk add --no-cache vips-dev && \
     rm -rf /var/cache/apk/*  && \
     adduser -s /sbin/nologin -D fars && \
     mkdir -p /app/data/images /app/data/cache && \
