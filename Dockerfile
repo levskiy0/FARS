@@ -1,11 +1,12 @@
 FROM golang:1.24-alpine AS builder
 # RUN apk add --no-cache vips-dev
-RUN apk add --no-cache build-base vips-dev pkgconfig
-# ENV CGO_ENABLED=0 GO111MODULE=on
-ENV CGO_ENABLED=1 GO111MODULE=on
+# RUN apk add --no-cache build-base vips-dev vips-heif pkgconfig
+RUN apk add --no-cache --virtual .build-deps \
+      build-base pkgconfig vips-dev libheif-dev
+ENV CGO_ENABLED=1 \
+    GO111MODULE=on
 WORKDIR /app
 
-# Pre-cache deps (later)
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -20,9 +21,10 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/fars ./cmd/fars-server
 # Slim runtime with libvips
 FROM alpine:3.22
 WORKDIR /app
-RUN apk add --no-cache vips-dev && \
+RUN apk add --no-cache vips vips-heif && \
     rm -rf /var/cache/apk/*  && \
-    adduser -s /sbin/nologin -D fars && \
+    # adduser -s /sbin/nologin -D fars && \
+    adduser -H -D -u 10001 -s /sbin/nologin fars && \
     mkdir -p /app/data/images /app/data/cache && \
     chown -R fars:fars /app
 USER fars

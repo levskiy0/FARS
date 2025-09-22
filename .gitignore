@@ -1,10 +1,14 @@
-# Ignore everything inside data/cache but keep the folder
 data/cache/*
 !data/cache/.gitkeep
 
-# Ignore everything inside data/images but keep the folder
 data/images/*
 !data/images/.gitkeep
+
+# tests/cache/*
+# !tests/cache/.gitkeep
+
+# tests/images/*
+# !tests/images/.gitkeep
 
 # Other ignores
 .DS_Store
