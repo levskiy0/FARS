@@ -183,17 +183,51 @@ func (h *Handler) handleResize(c *gin.Context) {
 		return
 	}
 
+	// Serve generated content FIRST with strong caching headers.
+	etag := buildContentETag(payload)
+	modTime := originalInfo.ModTime().UTC()
+
+	if matchETag(c.GetHeader("If-None-Match"), etag) {
+		c.Header("Cache-Control", cacheControlImmutable)
+		c.Header("ETag", etag)
+		c.Header("Last-Modified", modTime.Format(http.TimeFormat))
+		c.Status(http.StatusNotModified)
+	} else if ifModifiedSince := c.GetHeader("If-Modified-Since"); ifModifiedSince != "" {
+		if t, err := http.ParseTime(ifModifiedSince); err == nil && !modTime.After(t.UTC()) {
+			c.Header("Cache-Control", cacheControlImmutable)
+			c.Header("ETag", etag)
+			c.Header("Last-Modified", modTime.Format(http.TimeFormat))
+			c.Status(http.StatusNotModified)
+		} else {
+			c.Header("Content-Type", formatContentType[format])
+			c.Header("Cache-Control", cacheControlImmutable)
+			c.Header("ETag", etag)
+			c.Header("Last-Modified", modTime.Format(http.TimeFormat))
+			c.Header("Content-Length", strconv.Itoa(len(payload)))
+			c.Data(http.StatusOK, formatContentType[format], payload)
+		}
+	} else {
+		c.Header("Content-Type", formatContentType[format])
+		c.Header("Cache-Control", cacheControlImmutable)
+		c.Header("ETag", etag)
+		c.Header("Last-Modified", modTime.Format(http.TimeFormat))
+		c.Header("Content-Length", strconv.Itoa(len(payload)))
+		c.Data(http.StatusOK, formatContentType[format], payload)
+	}
+
+	// THEN try to save to cache; if it fails, log an error but do not fail the request.
 	if err := h.cache.Write(cachePath, payload); err != nil {
-		h.respondError(c, http.StatusInternalServerError, fmt.Errorf("store cache: %w", err))
-		return
+		h.logger.Error("cache store failed",
+			"path", cachePath,
+			"error", err,
+			"origin_mtime", originalInfo.ModTime().UTC(),
+			"width", width,
+			"height", height,
+			"source_path", originalPath,
+		)
 	}
 
-	if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
-		h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), false, time.Since(start), nil)
-		return
-	}
-
-	h.respondError(c, http.StatusInternalServerError, errors.New("unable to open cached file"))
+	h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), false, time.Since(start), nil)
 }
 
 type sourceCandidate struct {
