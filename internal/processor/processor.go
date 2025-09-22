@@ -85,6 +85,11 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 	}
 	options.Width = opts.Width
 	options.Height = opts.Height
+	if opts.Width > 0 && opts.Height > 0 {
+		options.Embed = false
+		options.Crop = true
+		options.Gravity = bimg.GravityCentre
+	}
 	result, err := img.Process(options)
 	if err != nil {
 		return nil, fmt.Errorf("process image: %w", err)

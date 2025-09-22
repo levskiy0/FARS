@@ -126,3 +126,48 @@ func diff(a, b uint8) uint8 {
 	}
 	return b - a
 }
+
+func TestResizeDownscaleRemovesBlackBorders(t *testing.T) {
+	srcWidth := 12
+	srcHeight := 6
+	src := image.NewNRGBA(image.Rect(0, 0, srcWidth, srcHeight))
+	fill := color.NRGBA{R: 10, G: 200, B: 30, A: 255}
+	draw.Draw(src, src.Bounds(), &image.Uniform{fill}, image.Point{}, draw.Src)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		t.Fatalf("encode source png: %v", err)
+	}
+	p := New()
+	target := 6
+	result, err := p.Resize(buf.Bytes(), Options{
+		Width:          target,
+		Height:         target,
+		Format:         FormatPNG,
+		JPEGQuality:    80,
+		WebPQuality:    75,
+		AVIFQuality:    45,
+		PNGCompression: 6,
+	})
+	if err != nil {
+		t.Fatalf("Resize returned error: %v", err)
+	}
+	decoded, err := png.Decode(bytes.NewReader(result))
+	if err != nil {
+		t.Fatalf("decode resized image: %v", err)
+	}
+	bounds := decoded.Bounds()
+	if bounds.Dx() != target || bounds.Dy() != target {
+		t.Fatalf("expected %dx%d, got %dx%d", target, target, bounds.Dx(), bounds.Dy())
+	}
+	for _, y := range []int{0, bounds.Dy() / 2, bounds.Dy() - 1} {
+		for x := 0; x < bounds.Dx(); x++ {
+			pixel := color.NRGBAModel.Convert(decoded.At(x, y)).(color.NRGBA)
+			if pixel.A != 255 {
+				t.Fatalf("expected opaque pixel at (%d,%d), got alpha=%d", x, y, pixel.A)
+			}
+			if diff(pixel.R, fill.R) > 5 || diff(pixel.G, fill.G) > 5 || diff(pixel.B, fill.B) > 5 {
+				t.Fatalf("expected fill color at (%d,%d), got %+v", x, y, pixel)
+			}
+		}
+	}
+}
