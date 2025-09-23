@@ -125,7 +125,7 @@ func defaultConfig() *Config {
 			WebPQuality:    75,
 			AVIFQuality:    75,
 			PNGCompression: 6,
-			AVIFSpeed:      8,
+			AVIFSpeed:      6,
 		},
 		Cache: CacheConfig{
 			TTL:             Duration{30 * 24 * time.Hour}, // 30d
