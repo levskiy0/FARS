@@ -79,7 +79,15 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 			} else {
 				stageHeight = contentHeight
 			}
-			stage, err := img.Process(bimg.Options{
+			srcImg := img
+			if opts.EnsureOpaque || opts.Format == FormatJPEG {
+				flattened, flatErr := p.flattenToWhite(source)
+				if flatErr != nil {
+					return nil, fmt.Errorf("flatten source: %w", flatErr)
+				}
+				srcImg = bimg.NewImage(flattened)
+			}
+			stage, err := srcImg.Process(bimg.Options{
 				Type:          bimg.PNG,
 				StripMetadata: true,
 				NoAutoRotate:  false,
@@ -216,4 +224,31 @@ func buildBaseOptions(opts Options) (bimg.Options, error) {
 		return bimg.Options{}, fmt.Errorf("unsupported format %q", opts.Format)
 	}
 	return options, nil
+}
+
+// flattenToWhite composites the image onto a white background, removing transparency.
+func (p *Processor) flattenToWhite(source []byte) ([]byte, error) {
+	pngData, err := bimg.NewImage(source).Process(bimg.Options{
+		Type: bimg.PNG,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("convert to png: %w", err)
+	}
+
+	decoded, err := png.Decode(bytes.NewReader(pngData))
+	if err != nil {
+		return nil, fmt.Errorf("decode png: %w", err)
+	}
+
+	bounds := decoded.Bounds()
+	flat := image.NewNRGBA(bounds)
+
+	draw.Draw(flat, bounds, &image.Uniform{color.White}, image.Point{}, draw.Src)
+	draw.Draw(flat, bounds, decoded, bounds.Min, draw.Over)
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, flat); err != nil {
+		return nil, fmt.Errorf("encode flattened: %w", err)
+	}
+	return buf.Bytes(), nil
 }
