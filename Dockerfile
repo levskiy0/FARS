@@ -16,7 +16,7 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/fars ./cmd/fars-server
 
 
 # Slim runtime with libvips
-FROM alpine:3.22
+FROM alpine:3.23
 WORKDIR /app
 RUN apk add --no-cache vips vips-heif && \
     rm -rf /var/cache/apk/*  && \
