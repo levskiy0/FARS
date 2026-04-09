@@ -78,6 +78,42 @@ func TestBuildSourceCandidates(t *testing.T) {
 				cacheSuffix: "",
 			}},
 		},
+		{
+			name:   "prestashop variant stripped",
+			input:  "65153-google_merchant/victron-foo.jpg",
+			rawExt: ".jpg",
+			want: []sourceCandidate{{
+				relative:    "65153/victron-foo.jpg",
+				cacheSuffix: "",
+			}},
+		},
+		{
+			name:   "prestashop variant stripped double extension",
+			input:  "65153-home_default/victron-foo.jpg.webp",
+			rawExt: ".webp",
+			want: []sourceCandidate{
+				{relative: "65153/victron-foo.jpg.webp", cacheSuffix: ""},
+				{relative: "65153/victron-foo.jpg", cacheSuffix: ".webp"},
+			},
+		},
+		{
+			name:   "prestashop bare id unchanged",
+			input:  "65153/victron-foo.jpg",
+			rawExt: ".jpg",
+			want: []sourceCandidate{{
+				relative:    "65153/victron-foo.jpg",
+				cacheSuffix: "",
+			}},
+		},
+		{
+			name:   "non numeric prefix unchanged",
+			input:  "brand-foo/slug.jpg",
+			rawExt: ".jpg",
+			want: []sourceCandidate{{
+				relative:    "brand-foo/slug.jpg",
+				cacheSuffix: "",
+			}},
+		},
 	}
 
 	for i := range tests {
