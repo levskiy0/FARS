@@ -44,6 +44,7 @@ type Manager struct {
 
 	indexMu             sync.RWMutex
 	originals           map[string]*trackedOriginal
+	bootstrapRetired    map[string]*trackedOriginal // Empty entries retained until discovery completes; guarded by indexMu.
 	variantToOriginal   map[string]string
 	indexGeneration     uint64
 	persistedGeneration uint64
@@ -363,8 +364,7 @@ func (m *Manager) trackVariant(originalRel string, info os.FileInfo, cachePath s
 		if old := m.originals[previous]; old != nil {
 			delete(old.Variants, cachePath)
 			if len(old.Variants) == 0 {
-				delete(m.originals, previous)
-				delete(m.pendingOriginals, previous)
+				m.retireOriginalLocked(previous, old)
 			}
 		}
 		delete(m.variantToOriginal, cachePath)
@@ -372,10 +372,15 @@ func (m *Manager) trackVariant(originalRel string, info os.FileInfo, cachePath s
 	}
 	entry := m.originals[clean]
 	if entry == nil {
-		entry = &trackedOriginal{Signature: signatureFromInfo(info), Variants: make(map[string]struct{})}
+		entry = m.bootstrapRetired[clean]
+		if entry == nil {
+			entry = &trackedOriginal{Signature: signatureFromInfo(info), Variants: make(map[string]struct{})}
+		} else {
+			delete(m.bootstrapRetired, clean)
+		}
 		m.originals[clean] = entry
 	}
-	if entry.Signature != signatureFromInfo(info) && !entry.Pending {
+	if entry.Pending || entry.Signature != signatureFromInfo(info) {
 		m.markPendingLocked(clean, entry)
 	}
 	// Retain the oldest baseline until all dependent variants have been invalidated.
@@ -399,11 +404,24 @@ func (m *Manager) unregisterVariant(cachePath string) {
 	if entry := m.originals[rel]; entry != nil {
 		delete(entry.Variants, cachePath)
 		if len(entry.Variants) == 0 {
-			delete(m.originals, rel)
-			delete(m.pendingOriginals, rel)
+			m.retireOriginalLocked(rel, entry)
 		}
 	}
 	m.indexGeneration++
+}
+
+// retireOriginalLocked keeps discovery history out of the active checking/deletion
+// queues. Otherwise removing the last known variant would lose the baseline for
+// another geometry/format not yet discovered. Caller holds indexMu.
+func (m *Manager) retireOriginalLocked(rel string, entry *trackedOriginal) {
+	if !m.indexReady && m.cfg.Cache.CheckOriginalsInterval.Duration > 0 {
+		if m.bootstrapRetired == nil {
+			m.bootstrapRetired = make(map[string]*trackedOriginal)
+		}
+		m.bootstrapRetired[rel] = entry
+	}
+	delete(m.originals, rel)
+	delete(m.pendingOriginals, rel)
 }
 
 func signatureFromInfo(info os.FileInfo) fileSignature {
@@ -458,14 +476,18 @@ func (m *Manager) flushManifest() error {
 			pending[rel] = value
 		}
 	}
-	for rel, entry := range m.originals {
-		if old, ok := originals[rel]; !ok {
-			originals[rel] = entry.Signature
-		} else if old != entry.Signature {
-			pending[rel] = true
-		}
-		if entry.Pending {
-			pending[rel] = true
+	// Retired entries still protect late discoveries, including after a restart
+	// during partial bootstrap. They disappear from snapshots once discovery ends.
+	for _, entries := range []map[string]*trackedOriginal{m.bootstrapRetired, m.originals} {
+		for rel, entry := range entries {
+			if old, ok := originals[rel]; !ok {
+				originals[rel] = entry.Signature
+			} else if old != entry.Signature {
+				pending[rel] = true
+			}
+			if entry.Pending {
+				pending[rel] = true
+			}
 		}
 	}
 	m.indexMu.RUnlock()
@@ -530,7 +552,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			return err
 		}
 		if ttl > 0 && time.Since(info.ModTime()) > ttl {
-			if _, err := m.removeCacheFileContext(ctx, path, &stats); err != nil {
+			if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); err != nil {
 				m.logger.Warn("remove stale cache", slog.String("path", path), slog.Any("error", err))
 			}
 			return nil
@@ -542,14 +564,14 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 		_, origInfo, err := m.resolveOriginalInfo(rel)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				if _, remErr := m.removeCacheFileContext(ctx, path, &stats); remErr != nil {
+				if _, remErr := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); remErr != nil {
 					m.logger.Warn("remove orphan cache", slog.String("path", path), slog.Any("error", remErr))
 				}
 			}
 			return nil
 		}
 		if origInfo.ModTime().After(info.ModTime()) {
-			if _, err := m.removeCacheFileContext(ctx, path, &stats); err != nil {
+			if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); err != nil {
 				m.logger.Warn("remove outdated cache", slog.String("path", path), slog.Any("error", err))
 			}
 		}
@@ -647,6 +669,29 @@ func cleanRelativePath(rel string) (string, error) {
 
 func (m *Manager) removeCacheFile(path string, stats *cleanupStats) (bool, error) {
 	return m.removeCacheFileContext(context.Background(), path, stats)
+}
+
+// removeCacheFileIfUnchanged discards cleanup decisions made about a previous
+// version of a file. The observation is revalidated under the publication lock;
+// replacements are left for a later cleanup pass to assess on their own merits.
+func (m *Manager) removeCacheFileIfUnchanged(ctx context.Context, path string, observed os.FileInfo, stats *cleanupStats) (bool, error) {
+	release, err := m.locks.LockContext(ctx, "cache:"+filepath.Clean(path))
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	current, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			m.unregisterVariant(path)
+			return false, nil
+		}
+		return false, err
+	}
+	if !os.SameFile(observed, current) || observed.Mode() != current.Mode() || signatureFromInfo(observed) != signatureFromInfo(current) {
+		return false, nil
+	}
+	return m.removeCacheFileLocked(path, stats)
 }
 
 func (m *Manager) removeCacheFileContext(ctx context.Context, path string, stats *cleanupStats) (bool, error) {

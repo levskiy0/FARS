@@ -454,6 +454,11 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 	ready := len(state.directories) == 0 && len(state.references) == 0
 	if ready != m.indexReady {
 		m.indexReady = ready
+		if ready {
+			// No unresolved cache references remain; active entries now own all
+			// remaining invalidations and retired history can be released.
+			m.bootstrapRetired = nil
+		}
 		m.indexGeneration++
 	}
 	m.indexMu.Unlock()
