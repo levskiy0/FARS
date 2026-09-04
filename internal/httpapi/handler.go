@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -20,7 +21,6 @@ import (
 
 	"fars/internal/cache"
 	"fars/internal/config"
-	"fars/internal/locker"
 	"fars/internal/processor"
 	"fars/internal/version"
 )
@@ -46,17 +46,15 @@ type Handler struct {
 	cfg       *config.Config
 	cache     *cache.Manager
 	processor *processor.Processor
-	locks     *locker.KeyedLocker
 	logger    *slog.Logger
 }
 
 // NewHandler constructs the HTTP handler.
-func NewHandler(cfg *config.Config, cache *cache.Manager, processor *processor.Processor, locks *locker.KeyedLocker, logger *slog.Logger) *Handler {
+func NewHandler(cfg *config.Config, cache *cache.Manager, processor *processor.Processor, logger *slog.Logger) *Handler {
 	return &Handler{
 		cfg:       cfg,
 		cache:     cache,
 		processor: processor,
-		locks:     locks,
 		logger:    logger.With("component", "handler"),
 	}
 }
@@ -64,6 +62,10 @@ func NewHandler(cfg *config.Config, cache *cache.Manager, processor *processor.P
 // Register attaches routes to gin engine.
 func (h *Handler) Register(r *gin.Engine) {
 	r.GET("/resize/:geometry/*filepath", h.handleResize)
+	if strings.TrimSpace(h.cfg.Cache.InvalidationToken) != "" {
+		r.POST("/cache/invalidate", h.handleInvalidate)
+		r.POST("/cclear/*filepath", h.handleClear)
+	}
 }
 
 func (h *Handler) handleResize(c *gin.Context) {
@@ -104,6 +106,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 	candidates := buildSourceCandidates(relative, rawExt)
 	var (
 		cacheRel     string
+		originalRel  string
 		originalPath string
 		originalInfo os.FileInfo
 		lastClean    string
@@ -128,6 +131,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 			h.respondError(c, http.StatusInternalServerError, fmt.Errorf("stat original: %w", statErr))
 			return
 		}
+		originalRel = cleanCandidate
 		originalPath = candidatePath
 		originalInfo = info
 		cacheRel = cleanCandidate
@@ -154,7 +158,21 @@ func (h *Handler) handleResize(c *gin.Context) {
 		}
 	}
 
-	release := h.locks.Lock(cachePath)
+	releaseOriginal := h.cache.LockOriginal(originalRel)
+	defer releaseOriginal()
+
+	refreshedInfo, statErr := os.Stat(originalPath)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			h.respondError(c, http.StatusNotFound, fmt.Errorf("original not found: %s", originalRel))
+			return
+		}
+		h.respondError(c, http.StatusInternalServerError, fmt.Errorf("stat original: %w", statErr))
+		return
+	}
+	originalInfo = refreshedInfo
+
+	release := h.cache.LockCache(cachePath)
 	defer release()
 	if h.cache.IsFresh(cachePath, originalInfo) {
 		if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
@@ -194,7 +212,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 		c.Header("ETag", etag)
 		c.Header("Last-Modified", modTime.Format(http.TimeFormat))
 		c.Status(http.StatusNotModified)
-	} else if ifModifiedSince := c.GetHeader("If-Modified-Since"); ifModifiedSince != "" {
+	} else if ifModifiedSince := c.GetHeader("If-Modified-Since"); c.GetHeader("If-None-Match") == "" && ifModifiedSince != "" {
 		if t, err := http.ParseTime(ifModifiedSince); err == nil && !modTime.After(t.UTC()) {
 			c.Header("Cache-Control", cacheControlImmutable)
 			c.Header("ETag", etag)
@@ -218,7 +236,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 	}
 
 	// THEN try to save to cache; if it fails, log an error but do not fail the request.
-	if err := h.cache.Write(cachePath, payload); err != nil {
+	if err := h.cache.Write(cachePath, originalRel, originalInfo, payload); err != nil {
 		h.logger.Error("cache store failed",
 			"path", cachePath,
 			"error", err,
@@ -230,6 +248,75 @@ func (h *Handler) handleResize(c *gin.Context) {
 	}
 
 	h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), false, time.Since(start), nil)
+}
+
+type invalidateRequest struct {
+	Paths []string `json:"paths" binding:"required,min=1,max=1000"`
+}
+
+func (h *Handler) authorizeInvalidation(c *gin.Context) bool {
+	expected := []byte("Bearer " + h.cfg.Cache.InvalidationToken)
+	provided := []byte(c.GetHeader("Authorization"))
+	if len(expected) != len(provided) || subtle.ConstantTimeCompare(expected, provided) != 1 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return false
+	}
+	return true
+}
+
+// handleClear accepts a URL-encoded original path; Gin has already decoded it.
+func (h *Handler) handleClear(c *gin.Context) {
+	if !h.authorizeInvalidation(c) {
+		return
+	}
+	h.invalidatePaths(c, []string{strings.TrimPrefix(c.Param("filepath"), "/")})
+}
+
+func (h *Handler) handleInvalidate(c *gin.Context) {
+	if !h.authorizeInvalidation(c) {
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+	var request invalidateRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	h.invalidatePaths(c, request.Paths)
+}
+
+func (h *Handler) invalidatePaths(c *gin.Context, paths []string) {
+	removed := 0
+	invalidated := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		clean, _, err := h.cfg.ResolvePaths(path)
+		// Match the manager's validation before deleting ANY path in the batch.
+		// ResolvePaths permits a leading slash and may also rewrite a path.
+		if err == nil && (strings.ContainsRune(path, 0) || strings.ContainsRune(clean, 0) || filepath.IsAbs(clean)) {
+			err = errors.New("invalid original path")
+		}
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "path": path})
+			return
+		}
+		if _, exists := seen[clean]; exists {
+			continue
+		}
+		seen[clean] = struct{}{}
+		invalidated = append(invalidated, clean)
+	}
+	for _, clean := range invalidated {
+		count, err := h.cache.InvalidateOriginal(c.Request.Context(), clean)
+		if err != nil {
+			h.logger.Error("manual cache invalidation failed", slog.String("path", clean), slog.Any("error", err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "cache invalidation failed", "path": clean})
+			return
+		}
+		removed += count
+	}
+	c.JSON(http.StatusOK, gin.H{"invalidated": invalidated, "variants_removed": removed})
 }
 
 type sourceCandidate struct {
@@ -315,7 +402,7 @@ func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format pro
 	}
 
 	ifModifiedSince := c.GetHeader("If-Modified-Since")
-	if ifModifiedSince != "" {
+	if c.GetHeader("If-None-Match") == "" && ifModifiedSince != "" {
 		if t, err := http.ParseTime(ifModifiedSince); err == nil {
 			if !modTime.After(t.UTC()) {
 				c.Header("Cache-Control", cacheControlImmutable)

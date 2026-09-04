@@ -29,21 +29,23 @@ var (
 	errInvalidGeometryLimit = errors.New("resize max dimensions must be positive")
 	envPathLookup           = buildEnvPathLookup()
 	envShortcutLookup       = map[string]string{
-		"HOST":             "server.host",
-		"PORT":             "server.port",
-		"IMAGES_BASE_DIR":  "storage.base_dir",
-		"CACHE_DIR":        "storage.cache_dir",
-		"MAX_WIDTH":        "resize.max_width",
-		"MAX_HEIGHT":       "resize.max_height",
-		"JPG_QUALITY":      "resize.jpg_quality",
-		"WEBP_QUALITY":     "resize.webp_quality",
-		"AVIF_QUALITY":     "resize.avif_quality",
-		"PNG_COMPRESSION":  "resize.png_compression",
-		"AVIF_SPEED":       "resize.avif_speed",
-		"GOMAXPROCS":       "runtime.gomaxprocs",
-		"VIPS_CONCURRENCY": "runtime.vips_concurrency",
-		"TTL":              "cache.ttl",
-		"CLEANUP_INTERVAL": "cache.cleanup_interval",
+		"HOST":                     "server.host",
+		"PORT":                     "server.port",
+		"IMAGES_BASE_DIR":          "storage.base_dir",
+		"CACHE_DIR":                "storage.cache_dir",
+		"MAX_WIDTH":                "resize.max_width",
+		"MAX_HEIGHT":               "resize.max_height",
+		"JPG_QUALITY":              "resize.jpg_quality",
+		"WEBP_QUALITY":             "resize.webp_quality",
+		"AVIF_QUALITY":             "resize.avif_quality",
+		"PNG_COMPRESSION":          "resize.png_compression",
+		"AVIF_SPEED":               "resize.avif_speed",
+		"GOMAXPROCS":               "runtime.gomaxprocs",
+		"VIPS_CONCURRENCY":         "runtime.vips_concurrency",
+		"TTL":                      "cache.ttl",
+		"CLEANUP_INTERVAL":         "cache.cleanup_interval",
+		"CHECK_ORIGINALS_INTERVAL": "cache.check_originals_interval",
+		"INVALIDATION_TOKEN":       "cache.invalidation_token",
 	}
 )
 
@@ -93,8 +95,12 @@ type RuntimeConfig struct {
 
 // CacheConfig stores cache retention settings.
 type CacheConfig struct {
-	TTL             Duration `yaml:"ttl"`
-	CleanupInterval Duration `yaml:"cleanup_interval"`
+	TTL                     Duration `yaml:"ttl"`
+	CleanupInterval         Duration `yaml:"cleanup_interval"`
+	CheckOriginalsInterval  Duration `yaml:"check_originals_interval"`
+	CheckOriginalsWorkers   int      `yaml:"check_originals_workers"`
+	InvalidationLockTimeout Duration `yaml:"invalidation_lock_timeout"`
+	InvalidationToken       string   `yaml:"invalidation_token"`
 }
 
 // Duration wraps time.Duration to support YAML strings like "30d".
@@ -128,8 +134,11 @@ func defaultConfig() *Config {
 			AVIFSpeed:      6,
 		},
 		Cache: CacheConfig{
-			TTL:             Duration{30 * 24 * time.Hour}, // 30d
-			CleanupInterval: Duration{24 * time.Hour},      // 24h
+			TTL:                     Duration{30 * 24 * time.Hour}, // 30d
+			CleanupInterval:         Duration{24 * time.Hour},      // 24h
+			CheckOriginalsInterval:  Duration{5 * time.Minute},
+			CheckOriginalsWorkers:   4,
+			InvalidationLockTimeout: Duration{100 * time.Millisecond},
 		},
 		Runtime: RuntimeConfig{},
 	}
@@ -354,6 +363,12 @@ func buildEnvPathLookup() map[string]string {
 
 // Validate returns an error if required configuration values are missing or invalid.
 func (c *Config) Validate() error {
+	if c.Cache.CheckOriginalsWorkers < 0 || c.Cache.CheckOriginalsWorkers > 64 {
+		return errors.New("cache.check_originals_workers must be between 0 and 64")
+	}
+	if c.Cache.InvalidationLockTimeout.Duration < 0 {
+		return errors.New("cache.invalidation_lock_timeout must be non-negative")
+	}
 	if strings.TrimSpace(c.Server.Host) == "" {
 		return errors.New("server.host must be set")
 	}

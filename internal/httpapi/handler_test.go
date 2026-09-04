@@ -21,7 +21,6 @@ import (
 
 	"fars/internal/cache"
 	"fars/internal/config"
-	"fars/internal/locker"
 	"fars/internal/processor"
 	"fars/internal/version"
 )
@@ -211,7 +210,6 @@ func TestTryServeFromCacheHeaders(t *testing.T) {
 	handler := &Handler{
 		cfg:    cfg,
 		cache:  cache.NewManager(cfg, logger),
-		locks:  locker.New(),
 		logger: logger,
 	}
 
@@ -276,7 +274,6 @@ func TestTryServeFromCacheConditional(t *testing.T) {
 	handler := &Handler{
 		cfg:    cfg,
 		cache:  cache.NewManager(cfg, logger),
-		locks:  locker.New(),
 		logger: logger,
 	}
 
