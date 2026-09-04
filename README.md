@@ -49,7 +49,7 @@ This invalidates the shared disk cache used by Nginx. A browser or upstream CDN 
 
 ### Manual invalidation
 
-Set `cache.invalidation_token` to enable `POST /cclear/{path}` and the existing batch `POST /cache/invalidate`. With an empty token neither route is registered. Supply original paths relative to `storage.base_dir`, without a geometry or output suffix. Configured rewrites apply. All paths are validated before deletion; the request is limited to 64 KiB and 1000 paths.
+Set `cache.invalidation_token` to enable `POST /cclear/{path}` and the existing batch `POST /cache/invalidate`. With an empty token neither route is registered. Supply original paths relative to `storage.base_dir`, without a geometry or output suffix. Configured rewrites apply. All paths are validated before deletion; batch requests are limited to 64 KiB and 1000 paths.
 
 For one original, send a bodyless POST (URL-encode spaces and other reserved characters once):
 
@@ -74,6 +74,12 @@ curl -X POST http://127.0.0.1:9090/cache/invalidate \
 ```
 
 The endpoint removes all currently cached sizes and output formats for each supplied original. If bootstrap has not finished or an original is not in memory, the endpoint performs a one-off cache scan for that path.
+
+### Validation and review
+
+The [detailed cache documentation](docs/cache-monitor.md) includes token setup, POST response codes, review findings, remaining reliability limits, and reproducible test commands. Validation passed with `go test -race ./...` and `go vet ./...`; selected regression tests passed 10 repetitions and the real PNG/WebP invalidation/regeneration lifecycle passed 5 repetitions. The review fixed partial batch deletion on invalid paths and stale orphan tasks deleting regenerated resizes.
+
+These tests use temporary data, not production images. They verify FARS's disk cache, not an external Nginx/CDN HTTP cache. Existing resize URLs and cache paths remain unchanged.
 
 ## Requirements
 
