@@ -17,6 +17,11 @@ func ParseFlexibleDuration(raw string) (time.Duration, error) {
 	if strings.TrimSpace(raw) == "0" {
 		return 0, nil
 	}
+	// Use standard Go units for subsecond lock budgets, retaining the existing
+	// day-based syntax below.
+	if duration, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil && duration >= 0 {
+		return duration, nil
+	}
 	matches := durationPattern.FindStringSubmatch(raw)
 	if matches == nil {
 		return 0, fmt.Errorf("invalid duration %q", raw)

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -51,14 +52,14 @@ func RegisterLifecycle(p Params) {
 		WriteTimeout:      30 * time.Second,
 	}
 
-	var cleanupCancel context.CancelFunc
+	var backgroundCancel context.CancelFunc
 
 	p.Lifecycle.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 			p.Logger.Info("starting HTTP server", slog.String("addr", srv.Addr))
-			cleanupCtx, cancel := context.WithCancel(context.Background())
-			cleanupCancel = cancel
-			p.Cache.StartCleanup(cleanupCtx)
+			backgroundCtx, cancel := context.WithCancel(context.Background())
+			backgroundCancel = cancel
+			p.Cache.StartBackground(backgroundCtx)
 			go func() {
 				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 					p.Logger.Error("http server failure", slog.Any("error", err))
@@ -68,10 +69,11 @@ func RegisterLifecycle(p Params) {
 		},
 		OnStop: func(ctx context.Context) error {
 			p.Logger.Info("stopping HTTP server")
-			if cleanupCancel != nil {
-				cleanupCancel()
+			shutdownErr := srv.Shutdown(ctx)
+			if backgroundCancel != nil {
+				backgroundCancel()
 			}
-			return srv.Shutdown(ctx)
+			return errors.Join(shutdownErr, p.Cache.WaitBackground(ctx))
 		},
 	})
 }
