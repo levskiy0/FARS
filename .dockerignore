@@ -24,3 +24,7 @@
 .vscode
 .idea
 *.iml
+
+# local build cache
+**/.gocache
+/fars
