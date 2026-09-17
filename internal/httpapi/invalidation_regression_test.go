@@ -39,6 +39,11 @@ func TestInvalidationValidatesWholeBatchBeforeDeleting(t *testing.T) {
 
 func TestMismatchedETagOverridesIfModifiedSince(t *testing.T) {
 	cfg := &config.Config{Storage: config.StorageConfig{BaseDir: t.TempDir(), CacheDir: t.TempDir()}}
+	originalPath := writeHTTPTestFile(t, cfg.Storage.BaseDir, "img/a.jpg", []byte("original"))
+	originalInfo, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatalf("stat original: %v", err)
+	}
 	path := writeHTTPTestFile(t, cfg.Storage.CacheDir, "200x200/img/a.jpg", []byte("new image"))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := NewHandler(cfg, cache.NewManager(cfg, logger), nil, logger)
@@ -47,7 +52,10 @@ func TestMismatchedETagOverridesIfModifiedSince(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodGet, "/resize/200x200/img/a.jpg", nil)
 	c.Request.Header.Set("If-None-Match", `"old-etag"`)
 	c.Request.Header.Set("If-Modified-Since", time.Now().Add(time.Hour).Format(http.TimeFormat))
-	if !h.tryServeFromCache(c, path, processor.FormatJPEG, nil) {
+	// tryServeFromCache now keys Last-Modified off the original's mtime, not
+	// the cache file's own, so it needs a real originalInfo (see fix for the
+	// Last-Modified inconsistency between a cache hit and a fresh render).
+	if !h.tryServeFromCache(c, path, processor.FormatJPEG, originalInfo) {
 		t.Fatal("cache miss")
 	}
 	if response.Code != http.StatusOK || response.Body.String() != "new image" {

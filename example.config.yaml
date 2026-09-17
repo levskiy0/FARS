@@ -1,6 +1,10 @@
 server:
   host: 0.0.0.0
   port: 9090
+  # Reverse proxies whose X-Forwarded-For may be believed (IPs or CIDRs).
+  # Empty trusts none: remote_ip in the access log is then the peer that
+  # opened the connection, i.e. Angie rather than the visitor.
+  trusted_proxies: []
 
 storage:
   base_dir: "./data/images/"
@@ -22,10 +26,20 @@ cache:
   check_originals_workers: 4
   invalidation_lock_timeout: "100ms"
   invalidation_token: ""
+  # Total cache size cap, e.g. "50gb". Empty or 0 disables size eviction and
+  # the cache is bounded only by ttl — an unauthenticated client can then fill
+  # the volume by requesting arbitrary geometries. Set this in production.
+  # With a cap set, a cache hit refreshes the entry's mtime (hourly at most),
+  # so both eviction and ttl measure time since last use rather than age.
+  max_size: ""
 
 runtime:
   gomaxprocs: 0
+  # Threads *inside* one libvips operation. Deployments keep this at 1-2 on
+  # purpose; it is not a request-concurrency setting.
   vips_concurrency: 0
+  # How many resizes may run at once. 0 = one per gomaxprocs.
+  resize_concurrency: 0
 
 rewrites:
   - pattern: "^(\\d)(-[\\w-]+)?/.+\\.jpg$"

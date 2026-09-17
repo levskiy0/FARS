@@ -23,12 +23,35 @@
    - Returns `404 Not Found` when no candidate exists.
 4. **Cache probe** – looks for `cache_dir/{geometry}/{path}` (double extensions append to the base path). A fresh entry is served immediately.
 5. **Resize** –
-   - Reads the original file (`os.ReadFile`).
+   - Reads the original file through an `os.Root` anchored at `storage.base_dir`.
    - Builds `bimg.Options` for the requested format; JPEG inputs are flattened with a white background to avoid transparent padding.
    - Processes the image and writes only the requested format/geometry to the cache.
 6. **Response** – sends the cached file with the appropriate `Content-Type`, `Cache-Control`, `ETag`, and `Last-Modified` headers.
 
 No background conversions are performed—each request produces exactly one cached artefact matching the requested format.
+
+`GET` and `HEAD` are both served. Client errors are reported as such rather than as
+500s: a geometry above the limits, a geometry whose derived second side would exceed
+the limits, a geometry that would shrink the source below one pixel on an axis, and a
+path containing a NUL byte return `400`; a missing path, a path that is not a regular
+file, and a path that leaves `storage.base_dir` through a symlink return `404`; an
+unsupported extension, or bytes that libvips cannot decode (including a zero-byte
+original), return `415`.
+
+`0x0` — what the PrestaShop module emits when it knows no dimensions — is **not** an
+error: it means "fit inside `resize.max_width` x `resize.max_height`, keeping the
+aspect ratio, never upscaling". A single side of `0` (`200x0`, `0x200`) still means
+"derive the other side from the source aspect ratio", and that derived side is subject
+to the same limits as an explicit one.
+
+Originals are opened through an `os.Root` anchored at `storage.base_dir`, so a symlink
+inside it — file or directory — cannot serve, or cache, anything from outside it.
+
+A resize is admitted through a semaphore sized from `runtime.resize_concurrency`
+(default: one slot per `GOMAXPROCS`), released as soon as the resize returns rather
+than when the response is finished. A request whose client has already disconnected is
+dropped before the work starts; one that disconnects while the resize runs still gets
+its result written to the cache, so the next visitor does not pay for it again.
 
 
 ## Cache invalidation and original monitor
@@ -115,6 +138,7 @@ Sample `config.yaml`:
 server:
   host: 0.0.0.0
   port: 9090
+  trusted_proxies: [] # e.g. ["10.0.0.0/8"]; empty trusts no proxy
 
 storage:
   base_dir: "/var/www/prestashop/img"
@@ -136,10 +160,12 @@ cache:
   check_originals_workers: 4
   invalidation_lock_timeout: "100ms"
   invalidation_token: "" # empty disables both manual invalidation routes
+  max_size: "" # e.g. "50gb"; empty or 0 disables size-based eviction
 
 runtime:
   gomaxprocs: 0
   vips_concurrency: 0
+  resize_concurrency: 0
 
 rewrites:
   - pattern: "^(\\d)(-[\\w-]+)?/.+\\.jpg$"
@@ -153,26 +179,32 @@ Key points:
 - `max_width` / `max_height` guard against excessive geometry. Requests beyond the limits return `400 Bad Request`.
 - `jpg_quality`, `webp_quality`, `avif_quality`, and `png_compression` feed directly into the libvips encoder settings.
 - `avif_speed` passes through to the libheif AVIF encoder (0 = slowest/best, 8 = fastest).
-- `cache.ttl`, `cache.cleanup_interval`, and `cache.check_originals_interval` accept human-friendly durations (`30d`, `12h30m`, `45s`). Use `"0"` to disable the corresponding background job.
+- `cache.ttl`, `cache.cleanup_interval`, and `cache.check_originals_interval` accept human-friendly duration strings (`30d`, `12h30m`, `45s`) or a bare unquoted number, interpreted as seconds (e.g. `ttl: 3600`). Use `0` (or `"0"`) to disable the corresponding background job.
 - `cache.check_originals_workers` sets the size of each check/deletion pool (default 4; 0 selects the default). Discovery also uses a bounded pool of that size. `cache.invalidation_lock_timeout` bounds a background invalidation attempt between filesystem calls (default 100ms; 0 selects the default). A blocking OS syscall itself cannot be interrupted by this timeout.
 - `cache.invalidation_token` enables the manual POST routes; keep it empty unless the endpoint is protected and needed.
+- `cache.max_size` caps the total size of `cache_dir`. Eviction runs after the TTL pass and removes least-recently-used entries until the cache is back under the cap. Empty or `0` means no cap, and the cache is then bounded only by `ttl` — since every distinct geometry writes a new file, an unauthenticated client can fill the volume. Set it in production.
+- Setting a cap also changes what `ttl` measures. With no cap, a variant's mtime is its publication time, so `ttl` expires it that long after it was generated. With a cap, a cache hit refreshes the variant's mtime (at most once an hour, so it costs nothing on a hot path), which makes both `ttl` and size eviction act on time since last use — the recency an image cache actually wants, and the reason eviction doesn't throw away the catalogue images every page loads.
+- `storage.base_dir` must already exist: FARS refuses to start otherwise instead of creating it. A missing bind mount used to produce an empty directory, a service that looked healthy, and a cleanup pass that deleted the whole variant cache as "orphans". `cache_dir` is still created on demand, and the two directories may not overlap (neither may be `/`, contain the other, or be the same path).
 - `runtime.gomaxprocs` and `runtime.vips_concurrency` allow tuning Go scheduler threads and libvips worker pool (0 keeps library defaults).
+- `runtime.resize_concurrency` caps how many resizes run at once; `0` means one per `GOMAXPROCS`. Keep it separate from `vips_concurrency`: that one sizes the thread pool *inside* a single libvips operation and is deliberately set to 1 or 2 in production, which is not a sensible number of concurrent requests.
+- `server.trusted_proxies` lists the reverse proxies (IPs or CIDRs) whose `X-Forwarded-For` may be believed, which is what the access log's `remote_ip` reports. Empty (the default) trusts none, so `remote_ip` is the peer that opened the connection — with Angie in front, that is Angie. Set it to the proxy's address to see real client IPs; never widen it to a range that reaches untrusted clients, or they can forge `remote_ip`.
 - Rewrite rules are evaluated sequentially; the first matching pattern rewrites the path and stops the chain.
 
 ### Environment Overrides
 
-Every option in the YAML can be supplied through environment variables. Two naming styles are supported:
+Every option in the YAML can be supplied through environment variables. Two naming styles are supported, and **`FARS_` is the preferred one** — it always wins when both are set for the same setting:
 
-- **Scoped** – prefix with `FARS_` and join nested keys with double underscores. Examples:
+- **Scoped (`FARS_`, preferred)** – prefix with `FARS_` and join nested keys with double underscores. Any config key can be reached this way. Examples:
   - `FARS_SERVER__PORT=8080`
+  - `FARS_SERVER__HOST=127.0.0.1`
   - `FARS_STORAGE__BASE_DIR=/srv/images`
-- **Legacy shortcuts** (kept for existing deployments): `PORT`, `IMAGES_BASE_DIR`, `CACHE_DIR`, `TTL`, `CLEANUP_INTERVAL`, `CHECK_ORIGINALS_INTERVAL`, `INVALIDATION_TOKEN`, plus the resize quality/limit keys.
+- **Legacy shortcuts (unprefixed)** – a fixed, explicit allowlist kept only for backward compatibility with the shipped `Dockerfile` and existing deployments: `PORT`, `IMAGES_BASE_DIR`, `CACHE_DIR`, `TTL`, `CLEANUP_INTERVAL`, `CHECK_ORIGINALS_INTERVAL`, `INVALIDATION_TOKEN`, `MAX_CACHE_SIZE`, plus the resize quality/limit keys (`MAX_WIDTH`, `MAX_HEIGHT`, `JPG_QUALITY`, `WEBP_QUALITY`, `AVIF_QUALITY`, `PNG_COMPRESSION`, `AVIF_SPEED`, `GOMAXPROCS`, `VIPS_CONCURRENCY`, `RESIZE_CONCURRENCY`). This surface is intentionally narrow: it does not support the `FOO__BAR` nested-path syntax, and it does **not** include a generic `HOST` — an ambient, unrelated `HOST` variable in the environment can no longer repoint the service. Use `FARS_HOST` for that. New deployments should prefer `FARS_`-prefixed variables throughout.
 
-Environment values override both the built-in defaults and anything read from YAML. Duration strings support the same syntax as the config file (`36h`, `15m30s`), and byte sizes accept units like `512kb`, `2mb`, `1giB`.
+Environment values override the built-in defaults and anything read from YAML. Between the two styles, the `FARS_`-prefixed value is applied last and wins if a setting is provided both ways. Duration strings support the same syntax as the config file (`36h`, `15m30s`), and byte sizes accept units like `512kb`, `2mb`, `1giB`.
 
 ## Development Notes
 
-- Run `go test ./...` for the unit tests.
+- Run `make test` for the full gate: race detector on, `-tags=integration` included. `make test-short` is the fast path without either. CI runs the same gate plus `gofmt`, `go vet`, staticcheck and govulncheck, and the image is only published if it passes.
 - Run the real filesystem inventory with `FARS_SCAN_BASE_DIR=/path/to/site FARS_SCAN_ORIGINALS_DIR=/path/to/site/img FARS_SCAN_CACHE_DIR=/path/to/cache go test -tags=integration ./internal/cache -run TestScanOriginalsAndResizes -v`.
 - If running tests in a sandboxed environment, set a local build cache: `GOCACHE=$(pwd)/.gocache go test ./...`.
 - Make sure `libvips` is reachable through your dynamic linker, otherwise `bimg` will fail at runtime.

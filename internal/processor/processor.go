@@ -2,6 +2,7 @@ package processor
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,6 +12,21 @@ import (
 
 	"github.com/h2non/bimg"
 )
+
+// ErrDimensionsTooLarge indicates that the requested geometry, or an axis
+// derived from it, would exceed the caller-supplied MaxWidth/MaxHeight
+// envelope. Callers map this to a client error.
+var ErrDimensionsTooLarge = errors.New("requested dimensions exceed configured limits")
+
+// ErrDegenerateGeometry indicates the requested geometry would shrink the
+// source below one pixel on an axis — libvips refuses to produce that image
+// ("shrunk to nothing"), so it is reported as a client error rather than a
+// service failure.
+var ErrDegenerateGeometry = errors.New("requested geometry shrinks the source below one pixel")
+
+// ErrUnsupportedSource indicates libvips could not read the payload as an
+// image at all (e.g. an image-extension file whose bytes are not an image).
+var ErrUnsupportedSource = errors.New("source is not a supported image")
 
 // Format enumerates supported output formats.
 type Format string
@@ -33,6 +49,12 @@ type Options struct {
 	AVIFSpeed      int
 	PNGCompression int
 	EnsureOpaque   bool
+	// MaxWidth and MaxHeight cap the canvas this request may produce,
+	// including an axis derived from the source aspect ratio when the other
+	// is 0. A value <= 0 disables the corresponding check (used by tests
+	// that construct Options directly, without going through the handler).
+	MaxWidth  int
+	MaxHeight int
 }
 
 // Processor wraps libvips via bimg to transform images.
@@ -46,7 +68,9 @@ func New() *Processor {
 // Resize applies the provided options to the source payload.
 func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 	if len(source) == 0 {
-		return nil, fmt.Errorf("source payload is empty")
+		// A truncated or zero-length original is undecodable input, not a
+		// service failure: same class as bytes libvips cannot read at all.
+		return nil, fmt.Errorf("%w: source payload is empty", ErrUnsupportedSource)
 	}
 	if converted := toSRGB(source); converted != nil {
 		source = converted
@@ -55,7 +79,13 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 
 	size, err := img.Size()
 	if err != nil {
-		return nil, fmt.Errorf("inspect source size: %w", err)
+		return nil, fmt.Errorf("inspect source size: %w: %w", ErrUnsupportedSource, err)
+	}
+	if size.Width <= 0 || size.Height <= 0 {
+		return nil, fmt.Errorf("%w: source reports %dx%d", ErrUnsupportedSource, size.Width, size.Height)
+	}
+	if opts.Width == 0 && opts.Height == 0 {
+		opts = fitEnvelope(opts, size)
 	}
 	switch {
 	case opts.Width > 0 && opts.Height > 0:
@@ -67,12 +97,13 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 		}
 		if scale < 1 {
 			contentWidth := int(math.Round(float64(size.Width) * scale))
-			if contentWidth < 1 {
-				contentWidth = 1
-			}
 			contentHeight := int(math.Round(float64(size.Height) * scale))
-			if contentHeight < 1 {
-				contentHeight = 1
+			if contentWidth < 1 || contentHeight < 1 {
+				// e.g. a 40x4000 source asked for 200x20: the content would
+				// be 0.2px wide. libvips fails this with "shrunk to nothing";
+				// the geometry is unrealizable for this source, so say so.
+				return nil, fmt.Errorf("%w: %dx%d source scaled to %dx%d for a %dx%d request",
+					ErrDegenerateGeometry, size.Width, size.Height, contentWidth, contentHeight, opts.Width, opts.Height)
 			}
 			limitByWidth := widthRatio <= heightRatio
 			stageWidth := 0
@@ -113,6 +144,13 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 			if canvas.Height < size.Height {
 				canvas.Height = size.Height
 			}
+			// The explicit axis was already checked by the caller; only the
+			// derived one can still exceed its cap. We reject rather than
+			// clamp so the response dimensions always match what was asked
+			// for instead of silently shrinking one axis but not the other.
+			if err := checkAxisCap(canvas.Height, opts.MaxHeight, "height"); err != nil {
+				return nil, err
+			}
 			return p.resizeWithCanvas(img, canvas)
 		}
 	case opts.Height > 0 && opts.Width == 0:
@@ -123,9 +161,44 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 			if canvas.Width < size.Width {
 				canvas.Width = size.Width
 			}
+			if err := checkAxisCap(canvas.Width, opts.MaxWidth, "width"); err != nil {
+				return nil, err
+			}
 			return p.resizeWithCanvas(img, canvas)
 		}
 	}
+	// Everything that reaches here hands bimg at most one axis and lets it
+	// derive the other from the source aspect ratio. That derived axis is
+	// just as client-controlled as the explicit one, so it gets the same cap
+	// and the same whole-canvas budget check before any pixels are allocated.
+	outWidth, outHeight := opts.Width, opts.Height
+	switch {
+	case outWidth > 0 && outHeight == 0:
+		outHeight = deriveAxis(outWidth, size.Width, size.Height)
+	case outHeight > 0 && outWidth == 0:
+		outWidth = deriveAxis(outHeight, size.Height, size.Width)
+	case outWidth == 0 && outHeight == 0:
+		// No envelope to fit into (MaxWidth/MaxHeight unset): the source is
+		// only transcoded, so it keeps its own size.
+		outWidth, outHeight = size.Width, size.Height
+	}
+	if outWidth < 1 || outHeight < 1 {
+		// The free axis scaled to less than a pixel (a very tall source asked
+		// for a small height, or the mirror of it). libvips refuses it, so
+		// this is reported as the client error it is instead of a 500.
+		return nil, fmt.Errorf("%w: %dx%d source scaled to %dx%d for a %dx%d request",
+			ErrDegenerateGeometry, size.Width, size.Height, outWidth, outHeight, opts.Width, opts.Height)
+	}
+	if err := checkAxisCap(outWidth, opts.MaxWidth, "width"); err != nil {
+		return nil, err
+	}
+	if err := checkAxisCap(outHeight, opts.MaxHeight, "height"); err != nil {
+		return nil, err
+	}
+	if err := checkCanvasBudget(outWidth, outHeight, opts.MaxWidth, opts.MaxHeight); err != nil {
+		return nil, err
+	}
+
 	options, err := buildBaseOptions(opts)
 	if err != nil {
 		return nil, err
@@ -159,6 +232,12 @@ func (p *Processor) resizeWithCanvas(img *bimg.Image, opts Options) ([]byte, err
 }
 
 func (p *Processor) renderCanvas(stage []byte, opts Options) ([]byte, error) {
+	// Belt-and-braces: whatever path computed opts.Width/opts.Height, never
+	// let image.NewNRGBA allocate more than the configured envelope allows.
+	if err := checkCanvasBudget(opts.Width, opts.Height, opts.MaxWidth, opts.MaxHeight); err != nil {
+		return nil, err
+	}
+
 	decoded, err := png.Decode(bytes.NewReader(stage))
 	if err != nil {
 		return nil, fmt.Errorf("decode intermediate image: %w", err)
@@ -195,6 +274,59 @@ func (p *Processor) renderCanvas(stage []byte, opts Options) ([]byte, error) {
 		return nil, fmt.Errorf("render final image: %w", err)
 	}
 	return result, nil
+}
+
+// fitEnvelope expands a request with both axes zero — what the PrestaShop
+// module emits when it knows no dimensions ("0x0") — into the largest box
+// inside MaxWidth x MaxHeight that keeps the source aspect ratio, never
+// upscaling. Without an envelope there is nothing to fit into, so the request
+// stays a plain transcode of the source at its own size.
+func fitEnvelope(opts Options, size bimg.ImageSize) Options {
+	if opts.MaxWidth <= 0 || opts.MaxHeight <= 0 {
+		return opts
+	}
+	scale := math.Min(
+		float64(opts.MaxWidth)/float64(size.Width),
+		float64(opts.MaxHeight)/float64(size.Height),
+	)
+	if scale >= 1 {
+		opts.Width = size.Width
+		opts.Height = size.Height
+		return opts
+	}
+	opts.Width = max(1, int(math.Round(float64(size.Width)*scale)))
+	opts.Height = max(1, int(math.Round(float64(size.Height)*scale)))
+	return opts
+}
+
+// deriveAxis returns the length of the free axis when only `target` is given:
+// srcOther scaled by target/srcTarget, the same ratio libvips applies. It can
+// come back as 0 for a degenerate request; the caller checks for that.
+func deriveAxis(target, srcTarget, srcOther int) int {
+	return int(math.Round(float64(srcOther) * float64(target) / float64(srcTarget)))
+}
+
+// checkAxisCap rejects a derived axis that exceeds its configured maximum.
+// max <= 0 means the caller did not supply a limit (e.g. a unit test
+// constructing Options directly), so the check is skipped.
+func checkAxisCap(value, max int, axis string) error {
+	if max > 0 && value > max {
+		return fmt.Errorf("%w: derived %s %d exceeds limit %d", ErrDimensionsTooLarge, axis, value, max)
+	}
+	return nil
+}
+
+// checkCanvasBudget rejects a canvas whose total pixel count exceeds
+// maxWidth*maxHeight, independent of how each axis was arrived at.
+func checkCanvasBudget(width, height, maxWidth, maxHeight int) error {
+	if maxWidth <= 0 || maxHeight <= 0 {
+		return nil
+	}
+	budget := int64(maxWidth) * int64(maxHeight)
+	if int64(width)*int64(height) > budget {
+		return fmt.Errorf("%w: canvas %dx%d exceeds pixel budget %d", ErrDimensionsTooLarge, width, height, budget)
+	}
+	return nil
 }
 
 func buildBaseOptions(opts Options) (bimg.Options, error) {

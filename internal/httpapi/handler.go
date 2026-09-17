@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,6 @@ import (
 	"fars/internal/cache"
 	"fars/internal/config"
 	"fars/internal/processor"
-	"fars/internal/version"
 )
 
 var (
@@ -47,21 +47,38 @@ type Handler struct {
 	cache     *cache.Manager
 	processor *processor.Processor
 	logger    *slog.Logger
+	// resizeSem bounds the number of concurrent processor.Resize calls so a
+	// burst of requests cannot pile up unbounded libvips/canvas allocations.
+	resizeSem chan struct{}
 }
 
 // NewHandler constructs the HTTP handler.
 func NewHandler(cfg *config.Config, cache *cache.Manager, processor *processor.Processor, logger *slog.Logger) *Handler {
+	concurrency := cfg.Runtime.ResizeConcurrency
+	if concurrency <= 0 {
+		// One in-flight resize per schedulable CPU. Deliberately NOT
+		// runtime.vips_concurrency: that knob sizes libvips' thread pool
+		// *inside* a single operation, and deployments set it to 1 or 2 on
+		// purpose, which would throttle the whole service to as many
+		// concurrent requests.
+		concurrency = runtime.GOMAXPROCS(0)
+		if concurrency <= 0 {
+			concurrency = runtime.NumCPU()
+		}
+	}
 	return &Handler{
 		cfg:       cfg,
 		cache:     cache,
 		processor: processor,
 		logger:    logger.With("component", "handler"),
+		resizeSem: make(chan struct{}, concurrency),
 	}
 }
 
 // Register attaches routes to gin engine.
 func (h *Handler) Register(r *gin.Engine) {
 	r.GET("/resize/:geometry/*filepath", h.handleResize)
+	r.HEAD("/resize/:geometry/*filepath", h.handleResize)
 	if strings.TrimSpace(h.cfg.Cache.InvalidationToken) != "" {
 		r.POST("/cache/invalidate", h.handleInvalidate)
 		r.POST("/cclear/*filepath", h.handleClear)
@@ -96,6 +113,13 @@ func (h *Handler) handleResize(c *gin.Context) {
 		h.respondError(c, http.StatusBadRequest, errors.New("path is required"))
 		return
 	}
+	if strings.ContainsRune(relative, 0) {
+		// A NUL byte makes os.Stat fail with EINVAL rather than
+		// os.ErrNotExist, which would otherwise fall through to a 500.
+		// Treated as malformed input (400), not merely "not found".
+		h.respondError(c, http.StatusBadRequest, errors.New("path contains a NUL byte"))
+		return
+	}
 	rawExt := filepath.Ext(relative)
 	ext := strings.ToLower(rawExt)
 	format, ok := extensionToFormat[ext]
@@ -103,6 +127,17 @@ func (h *Handler) handleResize(c *gin.Context) {
 		h.respondError(c, http.StatusUnsupportedMediaType, fmt.Errorf("unsupported extension %q", ext))
 		return
 	}
+	// Every access to an original goes through this root: it resolves each
+	// path component itself and refuses anything that leaves base_dir,
+	// including via a symlink. filepath.Join + os.Stat cannot do that — they
+	// follow a link straight out of the directory.
+	root, err := os.OpenRoot(h.cfg.Storage.BaseDir)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, fmt.Errorf("open base dir: %w", err))
+		return
+	}
+	defer root.Close()
+
 	candidates := buildSourceCandidates(relative, rawExt)
 	var (
 		cacheRel     string
@@ -118,9 +153,9 @@ func (h *Handler) handleResize(c *gin.Context) {
 			h.respondError(c, http.StatusBadRequest, err)
 			return
 		}
-		info, statErr := os.Stat(candidatePath)
+		info, statErr := root.Stat(rootRelative(cleanCandidate))
 		if statErr != nil {
-			if errors.Is(statErr, os.ErrNotExist) {
+			if isSourceUnreachable(statErr) {
 				lastClean = cleanCandidate
 				if i == len(candidates)-1 {
 					h.respondError(c, http.StatusNotFound, fmt.Errorf("original not found: %s", cleanCandidate))
@@ -130,6 +165,17 @@ func (h *Handler) handleResize(c *gin.Context) {
 			}
 			h.respondError(c, http.StatusInternalServerError, fmt.Errorf("stat original: %w", statErr))
 			return
+		}
+		if !isRegularFile(info) {
+			// A directory (or other non-regular entry) is not an image;
+			// treated the same as "not found" rather than surfacing whatever
+			// os.ReadFile/bimg would fail with further down.
+			lastClean = cleanCandidate
+			if i == len(candidates)-1 {
+				h.respondError(c, http.StatusNotFound, fmt.Errorf("original not found: %s", cleanCandidate))
+				return
+			}
+			continue
 		}
 		originalRel = cleanCandidate
 		originalPath = candidatePath
@@ -153,7 +199,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 	cachePath := h.cfg.CachePath(width, height, cacheRel)
 	if h.cache.IsFresh(cachePath, originalInfo) {
 		if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
-			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start), nil)
+			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start))
 			return
 		}
 	}
@@ -161,13 +207,17 @@ func (h *Handler) handleResize(c *gin.Context) {
 	releaseOriginal := h.cache.LockOriginal(originalRel)
 	defer releaseOriginal()
 
-	refreshedInfo, statErr := os.Stat(originalPath)
+	refreshedInfo, statErr := root.Stat(rootRelative(originalRel))
 	if statErr != nil {
-		if errors.Is(statErr, os.ErrNotExist) {
+		if isSourceUnreachable(statErr) {
 			h.respondError(c, http.StatusNotFound, fmt.Errorf("original not found: %s", originalRel))
 			return
 		}
 		h.respondError(c, http.StatusInternalServerError, fmt.Errorf("stat original: %w", statErr))
+		return
+	}
+	if !isRegularFile(refreshedInfo) {
+		h.respondError(c, http.StatusNotFound, fmt.Errorf("original not found: %s", originalRel))
 		return
 	}
 	originalInfo = refreshedInfo
@@ -176,14 +226,28 @@ func (h *Handler) handleResize(c *gin.Context) {
 	defer release()
 	if h.cache.IsFresh(cachePath, originalInfo) {
 		if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
-			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start), nil)
+			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start))
 			return
 		}
 	}
 
-	source, err := os.ReadFile(originalPath)
+	source, err := readSource(root, rootRelative(originalRel))
 	if err != nil {
 		h.respondError(c, http.StatusInternalServerError, fmt.Errorf("read original: %w", err))
+		return
+	}
+
+	if c.Request.Context().Err() != nil {
+		// Client is already gone; don't spend a resize slot or any CPU on it.
+		return
+	}
+
+	// Admission control: wait for a free slot rather than piling up unbounded
+	// concurrent libvips/canvas work. A queued request only gives up if the
+	// client disconnects while waiting.
+	select {
+	case h.resizeSem <- struct{}{}:
+	case <-c.Request.Context().Done():
 		return
 	}
 
@@ -197,45 +261,43 @@ func (h *Handler) handleResize(c *gin.Context) {
 		AVIFSpeed:      h.cfg.Resize.AVIFSpeed,
 		PNGCompression: h.cfg.Resize.PNGCompression,
 		EnsureOpaque:   ensureOpaque,
+		MaxWidth:       h.cfg.Resize.MaxWidth,
+		MaxHeight:      h.cfg.Resize.MaxHeight,
 	})
+	// The slot covers the resize itself and nothing else: held across the
+	// response write, one slow client would keep another resize out.
+	<-h.resizeSem
 	if err != nil {
-		h.respondError(c, http.StatusInternalServerError, err)
+		switch {
+		case errors.Is(err, processor.ErrDimensionsTooLarge), errors.Is(err, processor.ErrDegenerateGeometry):
+			h.respondError(c, http.StatusBadRequest, err)
+		case errors.Is(err, processor.ErrUnsupportedSource):
+			h.respondError(c, http.StatusUnsupportedMediaType, err)
+		default:
+			h.respondError(c, http.StatusInternalServerError, err)
+		}
 		return
 	}
 
-	// Serve generated content FIRST with strong caching headers.
-	etag := buildContentETag(payload)
-	modTime := originalInfo.ModTime().UTC()
+	// Truncated to the second, the precision Last-Modified is serialised at, so a
+	// client echoing back the exact value it was given compares equal instead of
+	// losing the sub-second remainder and always revalidating. Same rule as
+	// net/http's ServeContent.
+	modTime := originalInfo.ModTime().UTC().Truncate(time.Second)
 
-	if matchETag(c.GetHeader("If-None-Match"), etag) {
-		c.Header("Cache-Control", cacheControlImmutable)
-		c.Header("ETag", etag)
-		c.Header("Last-Modified", modTime.Format(http.TimeFormat))
-		c.Status(http.StatusNotModified)
-	} else if ifModifiedSince := c.GetHeader("If-Modified-Since"); c.GetHeader("If-None-Match") == "" && ifModifiedSince != "" {
-		if t, err := http.ParseTime(ifModifiedSince); err == nil && !modTime.After(t.UTC()) {
-			c.Header("Cache-Control", cacheControlImmutable)
-			c.Header("ETag", etag)
-			c.Header("Last-Modified", modTime.Format(http.TimeFormat))
-			c.Status(http.StatusNotModified)
-		} else {
-			c.Header("Content-Type", formatContentType[format])
-			c.Header("Cache-Control", cacheControlImmutable)
-			c.Header("ETag", etag)
-			c.Header("Last-Modified", modTime.Format(http.TimeFormat))
-			c.Header("Content-Length", strconv.Itoa(len(payload)))
-			c.Data(http.StatusOK, formatContentType[format], payload)
-		}
+	// Serve the generated content FIRST with strong caching headers — unless
+	// the client hung up while the resize was running, in which case there is
+	// nobody left to write the response to.
+	if c.Request.Context().Err() != nil {
+		h.logger.Warn("client disconnected, skipping response", "path", cachePath)
 	} else {
-		c.Header("Content-Type", formatContentType[format])
-		c.Header("Cache-Control", cacheControlImmutable)
-		c.Header("ETag", etag)
-		c.Header("Last-Modified", modTime.Format(http.TimeFormat))
-		c.Header("Content-Length", strconv.Itoa(len(payload)))
-		c.Data(http.StatusOK, formatContentType[format], payload)
+		h.respondWithPayload(c, payload, format, modTime)
 	}
 
-	// THEN try to save to cache; if it fails, log an error but do not fail the request.
+	// THEN save to cache; if it fails, log an error but do not fail the request.
+	// The bytes exist either way, so they are stored even for a client that is
+	// already gone: dropping them would make the next visitor pay for the very
+	// same resize again.
 	if err := h.cache.Write(cachePath, originalRel, originalInfo, payload); err != nil {
 		h.logger.Error("cache store failed",
 			"path", cachePath,
@@ -247,7 +309,37 @@ func (h *Handler) handleResize(c *gin.Context) {
 		)
 	}
 
-	h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), false, time.Since(start), nil)
+	h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), false, time.Since(start))
+}
+
+// respondWithPayload writes a freshly rendered variant, honouring the
+// conditional-request headers the client sent.
+func (h *Handler) respondWithPayload(c *gin.Context, payload []byte, format processor.Format, modTime time.Time) {
+	etag := buildContentETag(payload)
+	notModified := func() {
+		c.Header("Cache-Control", cacheControlImmutable)
+		c.Header("ETag", etag)
+		c.Header("Last-Modified", modTime.Format(http.TimeFormat))
+		c.Status(http.StatusNotModified)
+	}
+
+	if matchETag(c.GetHeader("If-None-Match"), etag) {
+		notModified()
+		return
+	}
+	if ifModifiedSince := c.GetHeader("If-Modified-Since"); c.GetHeader("If-None-Match") == "" && ifModifiedSince != "" {
+		if t, err := http.ParseTime(ifModifiedSince); err == nil && !modTime.After(t.UTC()) {
+			notModified()
+			return
+		}
+	}
+
+	c.Header("Content-Type", formatContentType[format])
+	c.Header("Cache-Control", cacheControlImmutable)
+	c.Header("ETag", etag)
+	c.Header("Last-Modified", modTime.Format(http.TimeFormat))
+	c.Header("Content-Length", strconv.Itoa(len(payload)))
+	c.Data(http.StatusOK, formatContentType[format], payload)
 }
 
 type invalidateRequest struct {
@@ -255,9 +347,12 @@ type invalidateRequest struct {
 }
 
 func (h *Handler) authorizeInvalidation(c *gin.Context) bool {
-	expected := []byte("Bearer " + h.cfg.Cache.InvalidationToken)
-	provided := []byte(c.GetHeader("Authorization"))
-	if len(expected) != len(provided) || subtle.ConstantTimeCompare(expected, provided) != 1 {
+	// Compare fixed-size digests rather than the raw tokens: a length check
+	// in front of subtle.ConstantTimeCompare would itself leak the expected
+	// token's length to a timing attacker.
+	expectedSum := sha256.Sum256([]byte("Bearer " + h.cfg.Cache.InvalidationToken))
+	providedSum := sha256.Sum256([]byte(c.GetHeader("Authorization")))
+	if subtle.ConstantTimeCompare(expectedSum[:], providedSum[:]) != 1 {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return false
 	}
@@ -307,16 +402,31 @@ func (h *Handler) invalidatePaths(c *gin.Context, paths []string) {
 		seen[clean] = struct{}{}
 		invalidated = append(invalidated, clean)
 	}
-	for _, clean := range invalidated {
-		count, err := h.cache.InvalidateOriginal(c.Request.Context(), clean)
-		if err != nil {
-			h.logger.Error("manual cache invalidation failed", slog.String("path", clean), slog.Any("error", err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "cache invalidation failed", "path": clean})
-			return
-		}
+	// Track what actually got deleted so a mid-batch failure can still tell
+	// the caller which paths are already gone — otherwise a retry of the
+	// whole batch would be the only option, and it wouldn't be idempotent.
+	// One batch call, so the cache geometries are listed once rather than once
+	// per path. Counts come back in input order and stop at the first failure.
+	counts, err := h.cache.InvalidateOriginals(c.Request.Context(), invalidated)
+	succeeded := invalidated[:len(counts)]
+	for _, count := range counts {
 		removed += count
 	}
-	c.JSON(http.StatusOK, gin.H{"invalidated": invalidated, "variants_removed": removed})
+	if err != nil {
+		failed := ""
+		if len(counts) < len(invalidated) {
+			failed = invalidated[len(counts)]
+		}
+		h.logger.Error("manual cache invalidation failed", slog.String("path", failed), slog.Any("error", err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":            "cache invalidation failed",
+			"path":             failed,
+			"invalidated":      succeeded,
+			"variants_removed": removed,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"invalidated": succeeded, "variants_removed": removed})
 }
 
 type sourceCandidate struct {
@@ -370,6 +480,9 @@ func (h *Handler) validateDimensions(width, height int) error {
 	if width < 0 || height < 0 {
 		return errors.New("dimensions must be non-negative")
 	}
+	// 0x0 is not an error: the PrestaShop module emits it whenever it cannot
+	// work out a size, and it means "fit inside resize.max_width x
+	// resize.max_height, keeping the aspect ratio, without upscaling".
 	if width > 0 && width > h.cfg.Resize.MaxWidth {
 		return fmt.Errorf("width %d exceeds limit %d", width, h.cfg.Resize.MaxWidth)
 	}
@@ -379,8 +492,49 @@ func (h *Handler) validateDimensions(width, height int) error {
 	return nil
 }
 
+// rootRelative turns a cleaned request path into a name an os.Root accepts:
+// slash-separated, never absolute.
+func rootRelative(clean string) string {
+	return filepath.FromSlash(strings.TrimPrefix(filepath.ToSlash(clean), "/"))
+}
+
+// readSource reads an original through the base-dir root, so a symlinked
+// entry cannot smuggle in a file from outside it.
+func readSource(root *os.Root, name string) ([]byte, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(file)
+}
+
+// isSourceUnreachable reports whether an os.Root lookup failed in a way that
+// means "there is no original here": it does not exist, or the path leaves
+// base_dir through a symlink or a .. segment. Both answer 404 — a link out of
+// the originals directory is not a servable image. os keeps the escape
+// sentinel unexported, so it is matched by message; a miss only downgrades
+// the response to a 500, it never grants access.
+func isSourceUnreachable(err error) bool {
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr.Err != nil && pathErr.Err.Error() == "path escapes from parent" {
+		return true
+	}
+	return false
+}
+
+// isRegularFile reports whether info describes a plain file, rejecting
+// directories, sockets, devices, etc. that stat successfully but are not
+// something we can read as an image.
+func isRegularFile(info os.FileInfo) bool {
+	return info != nil && info.Mode().IsRegular()
+}
+
 func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format processor.Format, originalInfo os.FileInfo) bool {
-	info, file, err := h.cache.ServeFileStats(cachePath)
+	_, file, err := h.cache.ServeFileStats(cachePath)
 	if err != nil {
 		return false
 	}
@@ -391,7 +545,11 @@ func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format pro
 		return false
 	}
 	etag := buildContentETag(payload)
-	modTime := info.ModTime().UTC()
+	// Use the original's mtime, not the cache file's own, so If-Modified-Since
+	// revalidation is consistent between a cache hit and a freshly rendered
+	// response for the same original. Truncated to the second for the same
+	// reason as in handleResize.
+	modTime := originalInfo.ModTime().UTC().Truncate(time.Second)
 
 	if matchETag(c.GetHeader("If-None-Match"), etag) {
 		c.Header("Cache-Control", cacheControlImmutable)
@@ -430,7 +588,9 @@ func (h *Handler) respondError(c *gin.Context, code int, err error) {
 		slog.String("geometry", c.Param("geometry")),
 		slog.String("path", c.Param("filepath")))
 	title := fmt.Sprintf("%d %s", code, http.StatusText(code))
-	body := fmt.Sprintf("<html><head><title>%s</title></head>\n<body>\n<center><h1>%s</h1></center>\n<hr><center>%s</center>\n</body></html> ", title, title, version.Identifier())
+	// The service name/version stays out of the client-facing body; it's
+	// still available to operators via the startup log.
+	body := fmt.Sprintf("<html><head><title>%s</title></head>\n<body>\n<center><h1>%s</h1></center>\n<hr><center>%s</center>\n</body></html> ", title, title, "FARS")
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Header("Cache-Control", "no-cache")
 	c.String(code, body)
@@ -483,7 +643,9 @@ func matchETag(header string, etag string) bool {
 	return false
 }
 
-func (h *Handler) logAccess(c *gin.Context, width, height int, rel string, originalMod time.Time, cached bool, dur time.Duration, err error) {
+// logAccess records a successfully served request. Failures are logged by
+// respondError instead, so this only ever reports success.
+func (h *Handler) logAccess(c *gin.Context, width, height int, rel string, originalMod time.Time, cached bool, dur time.Duration) {
 	attrs := []any{
 		"remote_ip", c.ClientIP(),
 		"width", width,
@@ -494,10 +656,6 @@ func (h *Handler) logAccess(c *gin.Context, width, height int, rel string, origi
 	}
 	if !originalMod.IsZero() {
 		attrs = append(attrs, "origin_mtime", originalMod.UTC())
-	}
-	if err != nil {
-		h.logger.Error("request failed", append(attrs, "error", err)...)
-		return
 	}
 	h.logger.Info("served image", attrs...)
 }

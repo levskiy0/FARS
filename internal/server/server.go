@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"fars/internal/cache"
 	"fars/internal/config"
 	"fars/internal/httpapi"
+	"fars/internal/version"
 )
 
 // Module exposes fx providers for the HTTP server.
@@ -38,6 +40,16 @@ func NewEngine(cfg *config.Config, handler *httpapi.Handler) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	// gin defaults to trusting every proxy, which lets any client spoof
+	// X-Forwarded-For and land it verbatim in c.ClientIP() / the access log's
+	// remote_ip field. Only the proxies named in server.trusted_proxies are
+	// believed; an empty list (the default) trusts nobody, and remote_ip is
+	// then whoever actually opened the connection.
+	if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+		// The entries were already validated by config.Validate, so this only
+		// fires if the two ever disagree.
+		panic(fmt.Errorf("server.trusted_proxies: %w", err))
+	}
 	handler.Register(r)
 	return r
 }
@@ -56,7 +68,7 @@ func RegisterLifecycle(p Params) {
 
 	p.Lifecycle.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
-			p.Logger.Info("starting HTTP server", slog.String("addr", srv.Addr))
+			p.Logger.Info("starting HTTP server", slog.String("addr", srv.Addr), slog.String("version", version.Identifier()))
 			backgroundCtx, cancel := context.WithCancel(context.Background())
 			backgroundCancel = cancel
 			p.Cache.StartBackground(backgroundCtx)
