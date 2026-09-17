@@ -12,13 +12,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knadh/koanf"
+	"github.com/go-viper/mapstructure/v2"
 	yamlparser "github.com/knadh/koanf/parsers/yaml"
-	"github.com/knadh/koanf/providers/env"
+	"github.com/knadh/koanf/providers/env/v2"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/providers/rawbytes"
 	"github.com/knadh/koanf/providers/structs"
-	"github.com/mitchellh/mapstructure"
+	"github.com/knadh/koanf/v2"
 	"gopkg.in/yaml.v3"
 
 	"fars/pkg/configutil"
@@ -288,7 +288,10 @@ func loadConfig(path string, raw []byte, allowMissing bool) (*Config, error) {
 
 func loadEnvVars(k *koanf.Koanf) error {
 	for _, prefix := range []string{"FARS_", ""} {
-		if err := k.Load(env.Provider(prefix, ".", canonicalEnvKey), nil); err != nil {
+		opt := env.Opt{Prefix: prefix, TransformFunc: func(key, value string) (string, any) {
+			return canonicalEnvKey(key), value
+		}}
+		if err := k.Load(env.Provider(".", opt), nil); err != nil {
 			return fmt.Errorf("load env: %w", err)
 		}
 	}

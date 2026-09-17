@@ -83,7 +83,7 @@ These tests use temporary data, not production images. They verify FARS's disk c
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.27+
 - libvips installed on the host (required by `bimg`).
 
 ## Quick Start
