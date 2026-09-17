@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,6 +24,40 @@ import (
 )
 
 const originalManifestName = ".fars-originals-v1.json"
+
+// tempFileSuffix marks in-progress publications. Such a file is never a cache
+// entry, and cleanup removes the ones a crashed write left behind.
+const tempFileSuffix = ".tmp"
+
+// staleTempFileAge keeps cleanup away from publications that are still running.
+const staleTempFileAge = time.Hour
+
+// evictionBucket is the resolution of the age histogram used to pick an eviction
+// cutoff without holding one record per cached file in memory.
+const evictionBucket = time.Hour
+
+// rootProbeTTL bounds how stale the cached base_dir presence check may be.
+const rootProbeTTL = time.Second
+
+// probeRetention drops cached answers about directories nothing asks about any
+// more, so the probe cache cannot grow with the paths of removed mounts.
+const probeRetention = time.Minute
+
+// The originals probe descends until it finds one regular file. The budgets
+// bound its cost on a network volume: originals in this deployment live a few
+// levels down (img/p/1/1/11.jpg), so a populated volume answers within a handful
+// of directory reads and an unpopulated one gives up quickly.
+const (
+	originalsProbeMaxDepth = 8
+	originalsProbeMaxDirs  = 64
+	originalsProbeBatch    = 128
+)
+
+// cacheHitTouchInterval rate-limits the modification-time refresh that turns
+// eviction into least-recently-used ordering. See noteCacheHit.
+const cacheHitTouchInterval = time.Hour
+
+var errEmptyCacheFile = errors.New("cached file is empty")
 
 // Manager handles cache lookups, writes, and background maintenance.
 type Manager struct {
@@ -42,6 +78,14 @@ type Manager struct {
 	bootstrapState   *bootstrapState
 	sourceStat       func(string) (os.FileInfo, error)
 
+	maxCacheSize atomic.Int64
+
+	// Cached answers to "does this directory actually hold originals", so the
+	// monitor can ask per key without probing the volume per key. See
+	// probeDirectoryCached.
+	probeMu sync.Mutex
+	probes  map[string]directoryProbe
+
 	indexMu             sync.RWMutex
 	originals           map[string]*trackedOriginal
 	bootstrapRetired    map[string]*trackedOriginal // Empty entries retained until discovery completes; guarded by indexMu.
@@ -52,8 +96,24 @@ type Manager struct {
 
 type trackedOriginal struct {
 	Signature fileSignature
-	Pending   bool
 	Variants  map[string]struct{}
+	// Doomed holds registered variants known to predate Signature. Invalidation
+	// deletes exactly this set, so a variant published afterwards survives even
+	// while older ones are still queued for removal.
+	Doomed map[string]struct{}
+	// Unknown marks history kept while discovery is incomplete: variants that
+	// exist on disk but are not indexed yet must be treated as stale.
+	Unknown bool
+}
+
+// pending reports whether anything about this original is still unresolved.
+func (t *trackedOriginal) pending() bool {
+	return len(t.Doomed) > 0 || t.Unknown
+}
+
+func (t *trackedOriginal) isDoomed(cachePath string) bool {
+	_, ok := t.Doomed[cachePath]
+	return ok
 }
 
 type fileSignature struct {
@@ -77,7 +137,7 @@ type IndexStats struct {
 
 // NewManager creates a cache manager bound to configuration.
 func NewManager(cfg *config.Config, logger *slog.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		cfg:               cfg,
 		logger:            logger.With("component", "cache"),
 		locks:             locker.New(),
@@ -89,6 +149,20 @@ func NewManager(cfg *config.Config, logger *slog.Logger) *Manager {
 		pendingOrphans:    make(map[string]struct{}),
 		sourceStat:        os.Stat,
 	}
+	if cfg != nil {
+		m.SetMaxCacheSize(cfg.Cache.MaxSize.Bytes)
+	}
+	return m
+}
+
+// SetMaxCacheSize caps the total size of the cache directory. Zero disables
+// size-based eviction, which is the behaviour of every deployment that does not
+// configure a limit.
+func (m *Manager) SetMaxCacheSize(limit int64) {
+	if limit < 0 {
+		limit = 0
+	}
+	m.maxCacheSize.Store(limit)
 }
 
 // LockOriginal serializes generation and invalidation for one source image.
@@ -113,13 +187,16 @@ func (m *Manager) EnsureParent(path string) error {
 // IsFresh determines whether cached file is still valid.
 func (m *Manager) IsFresh(cachePath string, originalInfo os.FileInfo) bool {
 	info, err := os.Stat(cachePath)
-	if err != nil || !info.Mode().IsRegular() {
+	// A zero-length file is never a valid image; an interrupted publication can
+	// leave one behind and it must not be served as an immutable resize.
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
 		return false
 	}
 	if originalInfo != nil {
+		clean := filepath.Clean(cachePath)
 		m.indexMu.RLock()
-		entry := m.originals[m.variantToOriginal[filepath.Clean(cachePath)]]
-		stale := entry != nil && (entry.Pending || entry.Signature != signatureFromInfo(originalInfo))
+		entry := m.originals[m.variantToOriginal[clean]]
+		stale := entry != nil && (entry.isDoomed(clean) || entry.Signature != signatureFromInfo(originalInfo))
 		m.indexMu.RUnlock()
 		if stale {
 			return false
@@ -132,7 +209,36 @@ func (m *Manager) IsFresh(cachePath string, originalInfo os.FileInfo) bool {
 	if ttl > 0 && time.Since(info.ModTime()) > ttl {
 		return false
 	}
+	m.noteCacheHit(cachePath, info)
 	return true
+}
+
+// noteCacheHit refreshes a cached file's modification time so that eviction
+// orders entries by last use instead of by creation. A cache file is never
+// rewritten after publication, so its mtime is its creation time: with a size
+// cap configured, eviction would otherwise discard the catalogue images every
+// page loads, keep one-off crawler geometries, and re-render the catalogue on
+// the next request.
+//
+// The refresh is deliberately narrow. It runs only when a size cap is
+// configured, so deployments without one keep strict "expire N after
+// publication" TTL semantics; with a cap, TTL expires entries that have not
+// been served for the TTL instead, which is what an image cache wants. The
+// mtime is its own rate limit: one Chtimes per cacheHitTouchInterval per file,
+// so a hot path costs no extra syscall. Only a hit that was judged fresh
+// touches the file, so a variant older than its original is never given a newer
+// mtime than the source it was made from.
+func (m *Manager) noteCacheHit(path string, info os.FileInfo) {
+	if m.maxCacheSize.Load() <= 0 {
+		return
+	}
+	now := time.Now()
+	if now.Sub(info.ModTime()) < cacheHitTouchInterval {
+		return
+	}
+	if err := os.Chtimes(path, now, now); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.logger.Warn("refresh cache entry age", slog.String("path", path), slog.Any("error", err))
+	}
 }
 
 // Write stores bytes atomically and registers the resize in the source index.
@@ -140,6 +246,9 @@ func (m *Manager) IsFresh(cachePath string, originalInfo os.FileInfo) bool {
 func (m *Manager) Write(cachePath, originalRel string, originalInfo os.FileInfo, payload []byte) error {
 	if originalInfo == nil {
 		return errors.New("source metadata is required")
+	}
+	if len(payload) == 0 {
+		return errors.New("refusing to cache an empty payload")
 	}
 	current, err := os.Stat(filepath.Join(m.cfg.Storage.BaseDir, filepath.FromSlash(originalRel)))
 	if err != nil {
@@ -151,15 +260,48 @@ func (m *Manager) Write(cachePath, originalRel string, originalInfo os.FileInfo,
 	if err := m.EnsureParent(cachePath); err != nil {
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
-	tmp := cachePath + ".tmp"
-	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
+	if err := writeFileAtomic(cachePath, payload); err != nil {
+		return err
+	}
+	m.publishVariant(originalRel, originalInfo, cachePath)
+	return nil
+}
+
+// writeFileAtomic publishes payload through a uniquely named temporary file, so
+// that another process sharing the cache volume cannot write into the same one,
+// and flushes it before the rename, so a crash cannot publish truncated bytes.
+func writeFileAtomic(path string, payload []byte) error {
+	file, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*"+tempFileSuffix)
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmp := file.Name()
+	closed, published := false, false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+		if !published {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := file.Write(payload); err != nil {
 		return fmt.Errorf("write temp file: %w", err)
 	}
-	if err := os.Rename(tmp, cachePath); err != nil {
-		_ = os.Remove(tmp)
+	if err := file.Chmod(0o644); err != nil {
+		return fmt.Errorf("set temp file mode: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	closed = true
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename temp file: %w", err)
 	}
-	m.trackVariant(originalRel, originalInfo, cachePath)
+	published = true
 	return nil
 }
 
@@ -174,6 +316,12 @@ func (m *Manager) ServeFileStats(cachePath string) (os.FileInfo, *os.File, error
 		file.Close()
 		return nil, nil, err
 	}
+	// Reject the truncated result of an interrupted publication instead of
+	// serving zero bytes with an immutable cache header.
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		file.Close()
+		return nil, nil, fmt.Errorf("%s: %w", cachePath, errEmptyCacheFile)
+	}
 	return info, file, nil
 }
 
@@ -186,16 +334,19 @@ func (m *Manager) StartBackground(ctx context.Context) {
 // WaitBackground waits until all cache jobs have observed cancellation.
 func (m *Manager) WaitBackground(ctx context.Context) error {
 	done := make(chan struct{})
+	// The helper returns as soon as the last worker does; a worker stuck in a
+	// syscall on a hung volume must not cost us the inventory learned so far.
 	go func() {
 		m.background.Wait()
 		close(done)
 	}()
+	var waitErr error
 	select {
 	case <-done:
-		return m.flushManifest()
 	case <-ctx.Done():
-		return ctx.Err()
+		waitErr = ctx.Err()
 	}
+	return errors.Join(waitErr, m.flushManifest())
 }
 
 // StartCleanup launches periodic cleanup until the context is cancelled.
@@ -227,11 +378,37 @@ func (m *Manager) StartCleanup(ctx context.Context) {
 
 // InvalidateOriginal removes every known resize for a relative original path.
 func (m *Manager) InvalidateOriginal(ctx context.Context, originalRel string) (int, error) {
-	return m.invalidateOriginal(ctx, originalRel, true)
+	geometries, err := m.cacheGeometries()
+	if err != nil {
+		return 0, err
+	}
+	return m.invalidateOriginal(ctx, originalRel, geometries)
 }
 
-// Only manual invalidation may discover variants not yet in the index.
-func (m *Manager) invalidateOriginal(ctx context.Context, originalRel string, discover bool) (int, error) {
+// InvalidateOriginals invalidates a batch of originals, listing the cache
+// geometries once for the whole batch instead of once per path. Counts are
+// returned in input order and processing stops at the first failure, so the
+// caller can tell which paths are already gone.
+func (m *Manager) InvalidateOriginals(ctx context.Context, originalRels []string) ([]int, error) {
+	geometries, err := m.cacheGeometries()
+	if err != nil {
+		return nil, err
+	}
+	removed := make([]int, 0, len(originalRels))
+	for _, rel := range originalRels {
+		count, err := m.invalidateOriginal(ctx, rel, geometries)
+		if err != nil {
+			return removed, err
+		}
+		removed = append(removed, count)
+	}
+	return removed, nil
+}
+
+// Only manual invalidation may discover variants not yet in the index; it passes
+// the cache geometries to derive candidate paths, background invalidation nil.
+func (m *Manager) invalidateOriginal(ctx context.Context, originalRel string, geometries []string) (int, error) {
+	discover := geometries != nil
 	clean, err := cleanRelativePath(originalRel)
 	if err != nil {
 		return 0, err
@@ -252,24 +429,29 @@ func (m *Manager) invalidateOriginal(ctx context.Context, originalRel string, di
 
 	m.indexMu.Lock()
 	entry := m.originals[clean]
-	if !discover && (entry == nil || !entry.Pending) {
+	if !discover && (entry == nil || len(entry.Doomed) == 0) {
 		m.indexMu.Unlock()
 		return 0, nil
 	}
 	var variants []string
 	if entry != nil {
-		variants = make([]string, 0, len(entry.Variants))
-		for path := range entry.Variants {
+		if discover {
+			m.markPendingLocked(clean, entry)
+		}
+		// Only variants known to predate the current source are removed; one
+		// published in the meantime is the new baseline and stays.
+		variants = make([]string, 0, len(entry.Doomed))
+		for path := range entry.Doomed {
 			variants = append(variants, path)
 		}
-		m.markPendingLocked(clean, entry)
 	}
-	ready := m.indexReady
 	m.indexMu.Unlock()
 
-	if discover && (!ready || len(variants) == 0) {
-		var found []string
-		found, err = m.findVariantsForOriginal(ctx, clean)
+	if discover {
+		found, err := m.candidateVariants(geometries, clean)
+		if err != nil {
+			return 0, err
+		}
 		seen := make(map[string]bool, len(variants))
 		for _, path := range variants {
 			seen[path] = true
@@ -279,9 +461,6 @@ func (m *Manager) invalidateOriginal(ctx context.Context, originalRel string, di
 				variants = append(variants, path)
 				seen[path] = true
 			}
-		}
-		if err != nil {
-			return 0, err
 		}
 	}
 
@@ -303,40 +482,61 @@ func (m *Manager) invalidateOriginal(ctx context.Context, originalRel string, di
 	return removed, errors.Join(errs...)
 }
 
-func (m *Manager) findVariantsForOriginal(ctx context.Context, originalRel string) ([]string, error) {
+// cacheGeometries lists the top-level directories of the cache root. Every cache
+// path is <cache_dir>/<geometry>/<original path>, so this one readdir is enough
+// to enumerate the candidates for any original without walking the whole tree.
+func (m *Manager) cacheGeometries() ([]string, error) {
+	entries, err := os.ReadDir(m.cfg.Storage.CacheDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	geometries := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			geometries = append(geometries, entry.Name())
+		}
+	}
+	return geometries, nil
+}
+
+// candidateVariants derives the cache paths an original can own: the geometry
+// copies of the path itself plus the fallback forms carrying an extra output
+// extension, and returns those that exist.
+func (m *Manager) candidateVariants(geometries []string, originalRel string) ([]string, error) {
+	rel := filepath.FromSlash(originalRel)
+	// Only a source that is itself a cacheable image gets double-extension
+	// variants, which is the ownership rule outputBase encodes.
+	if !isAllowedCacheExt(originalRel) {
+		return nil, nil
+	}
+	suffixes := make([]string, 0, len(allowedCacheExtensionList)+1)
+	suffixes = append(suffixes, "")
+	for _, ext := range allowedCacheExtensionList {
+		// An exact double-extension source is independent of its fallback source.
+		_, err := m.sourceStat(filepath.Join(m.cfg.Storage.BaseDir, rel+ext))
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		suffixes = append(suffixes, ext)
+	}
 	var variants []string
-	err := filepath.WalkDir(m.cfg.Storage.CacheDir, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if errors.Is(walkErr, os.ErrNotExist) {
-				return nil
+	for _, geometry := range geometries {
+		for _, suffix := range suffixes {
+			path := filepath.Join(m.cfg.Storage.CacheDir, geometry, rel+suffix)
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
 			}
-			return walkErr
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !isAllowedCacheExt(path) {
-			return nil
-		}
-		_, cacheRel, ok := splitCachePath(m.cfg.Storage.CacheDir, path)
-		if !ok {
-			return nil
-		}
-		cacheRel = filepath.ToSlash(filepath.Clean(cacheRel))
-		if cacheRel == originalRel {
 			variants = append(variants, path)
-		} else if outputBase(cacheRel) == originalRel {
-			// An exact double-extension source is independent of its fallback source.
-			_, err := os.Stat(filepath.Join(m.cfg.Storage.BaseDir, filepath.FromSlash(cacheRel)))
-			if errors.Is(err, os.ErrNotExist) {
-				variants = append(variants, path)
-			} else if err != nil {
-				return err
-			}
 		}
-		return nil
-	})
-	return variants, err
+	}
+	return variants, nil
 }
 
 func outputBase(cacheRel string) string {
@@ -354,18 +554,29 @@ func (m *Manager) Stats() IndexStats {
 	return IndexStats{Originals: len(m.originals), Variants: len(m.variantToOriginal)}
 }
 
+// trackVariant registers a variant found on disk. Its provenance is unknown, so
+// the stored baseline is retained and any pending state still applies to it.
 func (m *Manager) trackVariant(originalRel string, info os.FileInfo, cachePath string) {
+	m.registerVariant(originalRel, info, cachePath, false)
+}
+
+// publishVariant registers a variant that was just produced from info. Those
+// bytes are the new baseline, which is how an entry stops being stale without
+// having to be emptied by deletion first.
+func (m *Manager) publishVariant(originalRel string, info os.FileInfo, cachePath string) {
+	m.registerVariant(originalRel, info, cachePath, true)
+}
+
+func (m *Manager) registerVariant(originalRel string, info os.FileInfo, cachePath string, published bool) {
 	clean := filepath.ToSlash(filepath.Clean(originalRel))
 	cachePath = filepath.Clean(cachePath)
+	signature := signatureFromInfo(info)
 	m.indexMu.Lock()
 	defer m.indexMu.Unlock()
 	// Exact-source creation can change ownership of a former fallback variant.
 	if previous, ok := m.variantToOriginal[cachePath]; ok && previous != clean {
 		if old := m.originals[previous]; old != nil {
-			delete(old.Variants, cachePath)
-			if len(old.Variants) == 0 {
-				m.retireOriginalLocked(previous, old)
-			}
+			m.releaseVariantLocked(previous, old, cachePath)
 		}
 		delete(m.variantToOriginal, cachePath)
 		m.indexGeneration++
@@ -374,22 +585,32 @@ func (m *Manager) trackVariant(originalRel string, info os.FileInfo, cachePath s
 	if entry == nil {
 		entry = m.bootstrapRetired[clean]
 		if entry == nil {
-			entry = &trackedOriginal{Signature: signatureFromInfo(info), Variants: make(map[string]struct{})}
+			entry = &trackedOriginal{Signature: signature, Variants: make(map[string]struct{})}
 		} else {
 			delete(m.bootstrapRetired, clean)
 		}
 		m.originals[clean] = entry
+		m.indexGeneration++
 	}
-	if entry.Pending || entry.Signature != signatureFromInfo(info) {
-		m.markPendingLocked(clean, entry)
+	if _, exists := entry.Variants[cachePath]; !exists {
+		entry.Variants[cachePath] = struct{}{}
+		m.variantToOriginal[cachePath] = clean
+		m.indexGeneration++
 	}
-	// Retain the oldest baseline until all dependent variants have been invalidated.
-	if _, exists := entry.Variants[cachePath]; exists {
+	if !published {
+		if entry.pending() || entry.Signature != signature {
+			m.markPendingLocked(clean, entry)
+		}
 		return
 	}
-	entry.Variants[cachePath] = struct{}{}
-	m.variantToOriginal[cachePath] = clean
-	m.indexGeneration++
+	if entry.Signature != signature {
+		// Everything registered before this publication came from the previous
+		// source; from here on the freshly written bytes are the baseline.
+		m.markPendingLocked(clean, entry)
+		entry.Signature = signature
+		m.indexGeneration++
+	}
+	m.clearDoomedLocked(clean, entry, cachePath)
 }
 
 func (m *Manager) unregisterVariant(cachePath string) {
@@ -402,12 +623,30 @@ func (m *Manager) unregisterVariant(cachePath string) {
 	}
 	delete(m.variantToOriginal, cachePath)
 	if entry := m.originals[rel]; entry != nil {
-		delete(entry.Variants, cachePath)
-		if len(entry.Variants) == 0 {
-			m.retireOriginalLocked(rel, entry)
-		}
+		m.releaseVariantLocked(rel, entry, cachePath)
 	}
 	m.indexGeneration++
+}
+
+// releaseVariantLocked drops one variant from an entry. Caller holds indexMu.
+func (m *Manager) releaseVariantLocked(rel string, entry *trackedOriginal, cachePath string) {
+	delete(entry.Variants, cachePath)
+	m.clearDoomedLocked(rel, entry, cachePath)
+	if len(entry.Variants) == 0 {
+		m.retireOriginalLocked(rel, entry)
+	}
+}
+
+// clearDoomedLocked forgets the scheduled deletion of one variant and leaves the
+// invalidation queue once nothing is left to delete. Caller holds indexMu.
+func (m *Manager) clearDoomedLocked(rel string, entry *trackedOriginal, cachePath string) {
+	if _, ok := entry.Doomed[cachePath]; ok {
+		delete(entry.Doomed, cachePath)
+		m.indexGeneration++
+	}
+	if len(entry.Doomed) == 0 {
+		delete(m.pendingOriginals, rel)
+	}
 }
 
 // retireOriginalLocked keeps discovery history out of the active checking/deletion
@@ -485,7 +724,7 @@ func (m *Manager) flushManifest() error {
 			} else if old != entry.Signature {
 				pending[rel] = true
 			}
-			if entry.Pending {
+			if entry.pending() {
 				pending[rel] = true
 			}
 		}
@@ -524,8 +763,22 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 		return err
 	}
 	ttl := m.cfg.Cache.TTL.Duration
+	limit := m.maxCacheSize.Load()
+	m.forgetProbes()
+	// An unmounted or empty originals volume makes every cached file look like
+	// an orphan. Skip orphan deletion rather than wipe the cache while the bind
+	// mount is missing; TTL eviction is unaffected. This is only the opening
+	// answer: a pass over a large cache runs for minutes, so the question is
+	// asked again, per entry, before every orphan deletion below.
+	orphansAllowed := m.originalsRootPopulatedCached()
+	if !orphansAllowed {
+		m.logger.Warn("originals directory missing or empty; skipping orphan cleanup",
+			slog.String("base_dir", m.cfg.Storage.BaseDir))
+	}
 	m.logger.Info("cache cleanup started", slog.String("root", root))
 	stats := cleanupStats{}
+	usage := sizeUsage{}
+	staleTempBefore := time.Now().Add(-staleTempFileAge)
 	dirs := make([]string, 0, 16)
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -542,6 +795,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			return ctx.Err()
 		}
 		if !isAllowedCacheExt(path) {
+			m.removeStaleTemp(path, d, staleTempBefore)
 			return nil
 		}
 		info, err := d.Info()
@@ -563,22 +817,33 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 		}
 		_, origInfo, err := m.resolveOriginalInfo(rel)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+			// Re-ask before the deletion itself, not once for the whole pass:
+			// the volume can be pulled out halfway through one. The answer is
+			// cached for rootProbeTTL, so this costs a probe per second rather
+			// than a probe per file.
+			if errors.Is(err, os.ErrNotExist) && m.originalsAvailableFor(rel) {
 				if _, remErr := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); remErr != nil {
 					m.logger.Warn("remove orphan cache", slog.String("path", path), slog.Any("error", remErr))
 				}
+				return nil
 			}
+			usage.add(info)
 			return nil
 		}
 		if origInfo.ModTime().After(info.ModTime()) {
 			if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); err != nil {
 				m.logger.Warn("remove outdated cache", slog.String("path", path), slog.Any("error", err))
 			}
+			return nil
 		}
+		usage.add(info)
 		return nil
 	})
 	if walkErr != nil {
 		return walkErr
+	}
+	if err := m.evictBySize(ctx, limit, usage, &stats); err != nil {
+		return err
 	}
 	for i := len(dirs) - 1; i >= 0; i-- {
 		dir := dirs[i]
@@ -593,6 +858,273 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 		slog.Int("files_removed", stats.files),
 		slog.String("bytes_removed", human.FormatBytes(stats.bytes)),
 		slog.Int64("raw_bytes_removed", stats.bytes))
+	return nil
+}
+
+// originalsRootPopulated reports whether the originals volume actually holds
+// image data. Asking only whether base_dir has a dirent answers nothing here:
+// the data arrives through bind mounts nested inside it (base_dir/img,
+// base_dir/modules, base_dir/themes) and Docker creates those directories
+// whether or not anything is mounted into them, so the root looks populated
+// while the volume is empty. The probe therefore looks for a regular file,
+// descending a bounded number of directories and stopping at the first hit.
+func (m *Manager) originalsRootPopulated() bool {
+	return m.directoryHoldsFiles(m.cfg.Storage.BaseDir)
+}
+
+// directoryHoldsFiles reports whether dir contains a regular file within the
+// probe budget. Anything inconclusive - a permission error, an unreadable
+// directory, or the budget running out - counts as "no": the answer only ever
+// gates deletion, so an uncertain probe must never authorise one.
+func (m *Manager) directoryHoldsFiles(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	probe := originalsProbe{dirs: originalsProbeMaxDirs}
+	found, _ := probe.scan(dir, 0)
+	return found
+}
+
+// originalsProbe carries the remaining directory budget of one probe.
+type originalsProbe struct {
+	dirs int
+}
+
+// scan reports whether dir holds a regular file, and whether the search was cut
+// short by an error or by the budget. found is authoritative; inconclusive only
+// qualifies a negative answer.
+func (p *originalsProbe) scan(dir string, depth int) (found bool, inconclusive bool) {
+	if p.dirs <= 0 {
+		return false, true
+	}
+	p.dirs--
+	handle, err := os.Open(dir)
+	if err != nil {
+		return false, true
+	}
+	defer handle.Close()
+	var subdirs []string
+	for {
+		entries, err := handle.ReadDir(originalsProbeBatch)
+		for _, entry := range entries {
+			switch {
+			case entry.Type().IsRegular():
+				return true, false
+			case entry.Type()&os.ModeSymlink != 0:
+				// resolveOriginalInfo follows symlinks, so a link to an image
+				// is an original like any other.
+				if target, statErr := os.Stat(filepath.Join(dir, entry.Name())); statErr == nil && target.Mode().IsRegular() {
+					return true, false
+				}
+			case entry.IsDir() && depth < originalsProbeMaxDepth && len(subdirs) < originalsProbeMaxDirs:
+				subdirs = append(subdirs, filepath.Join(dir, entry.Name()))
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			inconclusive = true
+			break
+		}
+	}
+	for _, sub := range subdirs {
+		subFound, subInconclusive := p.scan(sub, depth+1)
+		if subFound {
+			return true, false
+		}
+		inconclusive = inconclusive || subInconclusive
+	}
+	return false, inconclusive
+}
+
+// directoryProbe is one remembered probe answer.
+type directoryProbe struct {
+	at time.Time
+	ok bool
+}
+
+// probeDirectoryCached answers directoryHoldsFiles at most once per
+// rootProbeTTL per directory. The monitor asks per key on every pass, and
+// probing the volume per key is the kind of cost that made the previous
+// full-tree walks a problem.
+func (m *Manager) probeDirectoryCached(dir string) bool {
+	now := time.Now()
+	m.probeMu.Lock()
+	defer m.probeMu.Unlock()
+	if cached, seen := m.probes[dir]; seen && now.Sub(cached.at) < rootProbeTTL {
+		return cached.ok
+	}
+	ok := m.directoryHoldsFiles(dir)
+	if previous, seen := m.probes[dir]; !seen || previous.ok != ok {
+		if !ok {
+			m.logger.Warn("originals directory holds no readable image; invalidation and orphan removal are paused",
+				"dir", dir, "base_dir", m.cfg.Storage.BaseDir)
+		} else if seen {
+			m.logger.Info("originals directory holds images again", "dir", dir)
+		}
+	}
+	if m.probes == nil {
+		m.probes = make(map[string]directoryProbe)
+	}
+	for key, entry := range m.probes {
+		if now.Sub(entry.at) > probeRetention {
+			delete(m.probes, key)
+		}
+	}
+	m.probes[dir] = directoryProbe{at: now, ok: ok}
+	return ok
+}
+
+func (m *Manager) originalsRootPopulatedCached() bool {
+	return m.probeDirectoryCached(m.cfg.Storage.BaseDir)
+}
+
+// forgetProbes drops the remembered answers, so a pass that runs for minutes
+// opens with a fresh look at the volume instead of one left over from the
+// previous pass. Within a pass the cache still bounds the cost.
+func (m *Manager) forgetProbes() {
+	m.probeMu.Lock()
+	clear(m.probes)
+	m.probeMu.Unlock()
+}
+
+// originalsAvailableFor reports whether the part of the volume that one
+// relative original belongs to is there. The root and the branch are asked
+// separately because base_dir/img, base_dir/modules and base_dir/themes are
+// separate bind mounts: the root can hold files while the one mount this entry
+// depends on is missing.
+func (m *Manager) originalsAvailableFor(rel string) bool {
+	if !m.originalsRootPopulatedCached() {
+		return false
+	}
+	branch := originalsBranch(rel)
+	if branch == "" {
+		return true
+	}
+	return m.probeDirectoryCached(filepath.Join(m.cfg.Storage.BaseDir, branch))
+}
+
+// originalsBranch returns the first path segment of a relative original, which
+// is the granularity at which this deployment mounts the originals volume. It
+// is empty for a file that sits directly in base_dir.
+func originalsBranch(rel string) string {
+	clean, err := cleanRelativePath(rel)
+	if err != nil {
+		return ""
+	}
+	first, _, ok := strings.Cut(clean, "/")
+	if !ok {
+		return ""
+	}
+	return first
+}
+
+// removeStaleTemp deletes what a crashed or failed publication left behind.
+// Such files are invisible to the cache index and would otherwise accumulate
+// and keep their directories from being pruned.
+func (m *Manager) removeStaleTemp(path string, d fs.DirEntry, before time.Time) {
+	if !strings.HasSuffix(path, tempFileSuffix) || d.Type()&os.ModeSymlink != 0 {
+		return
+	}
+	info, err := d.Info()
+	if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(before) {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.logger.Warn("remove abandoned temp file", slog.String("path", path), slog.Any("error", err))
+	}
+}
+
+// sizeUsage accumulates the cache footprint as an age histogram, so that a cap
+// can be enforced over millions of files without keeping a record per file.
+type sizeUsage struct {
+	total   int64
+	buckets map[int64]int64
+}
+
+func (u *sizeUsage) add(info os.FileInfo) {
+	u.total += info.Size()
+	if u.buckets == nil {
+		u.buckets = make(map[int64]int64)
+	}
+	u.buckets[info.ModTime().Unix()/int64(evictionBucket/time.Second)] += info.Size()
+}
+
+// cutoff returns the modification time below which deleting every cached file
+// frees at least need bytes.
+func (u *sizeUsage) cutoff(need int64) time.Time {
+	ages := make([]int64, 0, len(u.buckets))
+	for bucket := range u.buckets {
+		ages = append(ages, bucket)
+	}
+	sort.Slice(ages, func(i, j int) bool { return ages[i] < ages[j] })
+	freed := int64(0)
+	for _, bucket := range ages {
+		freed += u.buckets[bucket]
+		if freed >= need {
+			return time.Unix((bucket+1)*int64(evictionBucket/time.Second), 0)
+		}
+	}
+	return time.Now()
+}
+
+// evictBySize removes the least recently used cached files until the cache fits
+// the cap. Eviction is by modification time: container volumes are commonly
+// mounted with relatime or noatime, so access times are not a dependable
+// recency signal. noteCacheHit keeps that modification time meaning "last
+// served" whenever a cap is configured, which is what makes this order LRU
+// rather than "oldest published first".
+func (m *Manager) evictBySize(ctx context.Context, limit int64, usage sizeUsage, stats *cleanupStats) error {
+	if limit <= 0 || usage.total <= limit {
+		return nil
+	}
+	need := usage.total - limit
+	cutoff := usage.cutoff(need)
+	m.logger.Warn("cache size over the configured cap; evicting oldest entries",
+		slog.String("size", human.FormatBytes(usage.total)),
+		slog.String("limit", human.FormatBytes(limit)),
+		slog.String("to_free", human.FormatBytes(need)),
+		slog.Time("older_than", cutoff))
+	freed := int64(0)
+	before := stats.bytes
+	walkErr := filepath.WalkDir(m.cfg.Storage.CacheDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !isAllowedCacheExt(path) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
+			return nil
+		}
+		if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, stats); err != nil {
+			m.logger.Warn("evict cache entry", slog.String("path", path), slog.Any("error", err))
+			return nil
+		}
+		freed = stats.bytes - before
+		if freed >= need {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return walkErr
+	}
+	m.logger.Info("cache size eviction finished",
+		slog.String("freed", human.FormatBytes(freed)),
+		slog.String("size", human.FormatBytes(usage.total-freed)),
+		slog.String("limit", human.FormatBytes(limit)))
 	return nil
 }
 
@@ -620,6 +1152,16 @@ var allowedCacheExtensions = map[string]struct{}{
 	".jpg":  {},
 	".jpeg": {},
 }
+
+// allowedCacheExtensionList is the deterministic form of allowedCacheExtensions.
+var allowedCacheExtensionList = func() []string {
+	list := make([]string, 0, len(allowedCacheExtensions))
+	for ext := range allowedCacheExtensions {
+		list = append(list, ext)
+	}
+	sort.Strings(list)
+	return list
+}()
 
 func isAllowedCacheExt(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
@@ -665,10 +1207,6 @@ func cleanRelativePath(rel string) (string, error) {
 		return "", errors.New("invalid original path")
 	}
 	return clean, nil
-}
-
-func (m *Manager) removeCacheFile(path string, stats *cleanupStats) (bool, error) {
-	return m.removeCacheFileContext(context.Background(), path, stats)
 }
 
 // removeCacheFileIfUnchanged discards cleanup decisions made about a previous

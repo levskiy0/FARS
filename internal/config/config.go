@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -42,12 +43,33 @@ var (
 		"AVIF_SPEED":               "resize.avif_speed",
 		"GOMAXPROCS":               "runtime.gomaxprocs",
 		"VIPS_CONCURRENCY":         "runtime.vips_concurrency",
+		"RESIZE_CONCURRENCY":       "runtime.resize_concurrency",
 		"TTL":                      "cache.ttl",
 		"CLEANUP_INTERVAL":         "cache.cleanup_interval",
 		"CHECK_ORIGINALS_INTERVAL": "cache.check_originals_interval",
 		"INVALIDATION_TOKEN":       "cache.invalidation_token",
+		"MAX_CACHE_SIZE":           "cache.max_size",
 	}
+	// legacyEnvShortcutLookup is the allowlist for unprefixed (legacy)
+	// environment variables, kept for backward compatibility with the
+	// shipped Dockerfile and existing deployments. It is a strict subset of
+	// envShortcutLookup: generic names such as HOST are intentionally
+	// excluded here so an ambient env var can't silently repoint the
+	// service. FARS_HOST (and the rest of the FARS_ namespace) remains the
+	// preferred, unrestricted way to configure the service.
+	legacyEnvShortcutLookup = buildLegacyEnvShortcutLookup()
 )
+
+func buildLegacyEnvShortcutLookup() map[string]string {
+	legacy := make(map[string]string, len(envShortcutLookup))
+	for key, path := range envShortcutLookup {
+		if key == "HOST" {
+			continue
+		}
+		legacy[key] = path
+	}
+	return legacy
+}
 
 // Config represents the full service configuration loaded from YAML.
 type Config struct {
@@ -63,6 +85,10 @@ type Config struct {
 type ServerConfig struct {
 	Host string `yaml:"host"`
 	Port int    `yaml:"port"`
+	// TrustedProxies lists the IPs/CIDRs of the reverse proxies in front of
+	// FARS whose X-Forwarded-For header may be believed. Empty trusts none,
+	// so the access log records the immediate peer.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 // Address returns the server listen address in host:port form.
@@ -91,6 +117,11 @@ type ResizeConfig struct {
 type RuntimeConfig struct {
 	GOMAXPROCS      int `yaml:"gomaxprocs"`
 	VIPSConcurrency int `yaml:"vips_concurrency"`
+	// ResizeConcurrency bounds how many resizes may run at once. 0 means one
+	// per schedulable CPU (GOMAXPROCS). It is deliberately separate from
+	// VIPSConcurrency, which sizes the thread pool inside a single libvips
+	// operation and is routinely set to 1.
+	ResizeConcurrency int `yaml:"resize_concurrency"`
 }
 
 // CacheConfig stores cache retention settings.
@@ -101,6 +132,7 @@ type CacheConfig struct {
 	CheckOriginalsWorkers   int      `yaml:"check_originals_workers"`
 	InvalidationLockTimeout Duration `yaml:"invalidation_lock_timeout"`
 	InvalidationToken       string   `yaml:"invalidation_token"`
+	MaxSize                 ByteSize `yaml:"max_size"`
 }
 
 // Duration wraps time.Duration to support YAML strings like "30d".
@@ -158,6 +190,32 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 // UnmarshalText allows decoding durations from koanf/env providers.
 func (d *Duration) UnmarshalText(text []byte) error {
 	return d.parseFromString(string(text))
+}
+
+// numericSecondsToDurationHookFunc lets a bare YAML/env integer or float
+// (e.g. `ttl: 0` or `cleanup_interval: 3600`) decode into a Duration field
+// as a count of seconds, alongside the existing string forms ("30d", "24h").
+// It leaves string sources untouched so mapstructure.TextUnmarshallerHookFunc
+// still handles those.
+func numericSecondsToDurationHookFunc() mapstructure.DecodeHookFuncType {
+	return func(from reflect.Type, to reflect.Type, data any) (any, error) {
+		if to != reflect.TypeOf(Duration{}) {
+			return data, nil
+		}
+		switch from.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			seconds := reflect.ValueOf(data).Int()
+			return Duration{time.Duration(seconds) * time.Second}, nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			seconds := reflect.ValueOf(data).Uint()
+			return Duration{time.Duration(seconds) * time.Second}, nil
+		case reflect.Float32, reflect.Float64:
+			seconds := reflect.ValueOf(data).Float()
+			return Duration{time.Duration(seconds * float64(time.Second))}, nil
+		default:
+			return data, nil
+		}
+	}
 }
 
 func (d *Duration) parseFromString(raw string) error {
@@ -274,6 +332,7 @@ func loadConfig(path string, raw []byte, allowMissing bool) (*Config, error) {
 			WeaklyTypedInput: true,
 			Result:           &cfg,
 			DecodeHook: mapstructure.ComposeDecodeHookFunc(
+				numericSecondsToDurationHookFunc(),
 				mapstructure.TextUnmarshallerHookFunc(),
 			),
 		},
@@ -286,26 +345,52 @@ func loadConfig(path string, raw []byte, allowMissing bool) (*Config, error) {
 	return &cfg, cfg.Validate()
 }
 
+// loadEnvVars applies environment overrides in two passes. The legacy
+// unprefixed pass is loaded first and only recognizes an explicit allowlist
+// of names; the FARS_-prefixed pass is loaded last so it always wins over
+// both YAML and any ambient unprefixed variable of the same shortcut name.
 func loadEnvVars(k *koanf.Koanf) error {
-	for _, prefix := range []string{"FARS_", ""} {
-		opt := env.Opt{Prefix: prefix, TransformFunc: func(key, value string) (string, any) {
-			return canonicalEnvKey(key), value
-		}}
-		if err := k.Load(env.Provider(".", opt), nil); err != nil {
-			return fmt.Errorf("load env: %w", err)
-		}
+	legacyOpt := env.Opt{Prefix: "", TransformFunc: func(key, value string) (string, any) {
+		return legacyEnvKey(key), value
+	}}
+	if err := k.Load(env.Provider(".", legacyOpt), nil); err != nil {
+		return fmt.Errorf("load env: %w", err)
+	}
+	scopedOpt := env.Opt{Prefix: "FARS_", TransformFunc: func(key, value string) (string, any) {
+		return canonicalEnvKey(key), value
+	}}
+	if err := k.Load(env.Provider(".", scopedOpt), nil); err != nil {
+		return fmt.Errorf("load env: %w", err)
 	}
 	return nil
 }
 
+// legacyEnvKey maps an unprefixed (legacy) environment variable name to its
+// config path. It only recognizes the explicit legacyEnvShortcutLookup
+// allowlist: no nested "__" path syntax and no generic per-field names, so
+// an unrelated ambient variable can't repoint the service. Anything already
+// carrying the FARS_ prefix is left to the scoped pass.
+func legacyEnvKey(key string) string {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" || strings.HasPrefix(trimmed, "FARS_") {
+		return ""
+	}
+	upper := strings.ToUpper(trimmed)
+	if mapped, ok := legacyEnvShortcutLookup[upper]; ok {
+		return mapped
+	}
+	return ""
+}
+
+// canonicalEnvKey maps a FARS_-prefixed environment variable name to its
+// config path, supporting the full "__" nested-path syntax plus the
+// shortcut and generic path lookups.
 func canonicalEnvKey(key string) string {
 	trimmed := strings.TrimSpace(key)
 	if trimmed == "" {
 		return ""
 	}
-	if strings.HasPrefix(trimmed, "FARS_") {
-		trimmed = strings.TrimPrefix(trimmed, "FARS_")
-	}
+	trimmed = strings.TrimPrefix(trimmed, "FARS_")
 	if strings.Contains(trimmed, "__") {
 		lower := strings.ToLower(trimmed)
 		return strings.ReplaceAll(lower, "__", ".")
@@ -372,6 +457,9 @@ func (c *Config) Validate() error {
 	if c.Cache.InvalidationLockTimeout.Duration < 0 {
 		return errors.New("cache.invalidation_lock_timeout must be non-negative")
 	}
+	if c.Cache.MaxSize.Bytes < 0 {
+		return errors.New("cache.max_size must be non-negative")
+	}
 	if strings.TrimSpace(c.Server.Host) == "" {
 		return errors.New("server.host must be set")
 	}
@@ -384,8 +472,11 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Storage.CacheDir) == "" {
 		return errors.New("storage.cache_dir must be set")
 	}
-	if err := ensureDirExists(c.Storage.BaseDir); err != nil {
+	if err := checkDirExists(c.Storage.BaseDir); err != nil {
 		return fmt.Errorf("validate storage.base_dir: %w", err)
+	}
+	if err := validateStorageContainment(c.Storage.BaseDir, c.Storage.CacheDir); err != nil {
+		return err
 	}
 	if err := ensureDirExists(c.Storage.CacheDir); err != nil {
 		return fmt.Errorf("validate storage.cache_dir: %w", err)
@@ -413,6 +504,34 @@ func (c *Config) Validate() error {
 	}
 	if c.Runtime.VIPSConcurrency < 0 {
 		return fmt.Errorf("runtime.vips_concurrency must be >= 0, got %d", c.Runtime.VIPSConcurrency)
+	}
+	if c.Runtime.ResizeConcurrency < 0 {
+		return fmt.Errorf("runtime.resize_concurrency must be >= 0, got %d", c.Runtime.ResizeConcurrency)
+	}
+	if err := validateTrustedProxies(c.Server.TrustedProxies); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTrustedProxies checks every entry is an IP address or a CIDR block,
+// the two forms gin's SetTrustedProxies accepts. A typo here would otherwise
+// only surface at startup as an opaque engine error.
+func validateTrustedProxies(entries []string) error {
+	for i, entry := range entries {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			return fmt.Errorf("server.trusted_proxies[%d] must not be empty", i)
+		}
+		if strings.Contains(trimmed, "/") {
+			if _, _, err := net.ParseCIDR(trimmed); err != nil {
+				return fmt.Errorf("server.trusted_proxies[%d] %q is not a valid CIDR: %w", i, entry, err)
+			}
+			continue
+		}
+		if net.ParseIP(trimmed) == nil {
+			return fmt.Errorf("server.trusted_proxies[%d] %q is not a valid IP address or CIDR", i, entry)
+		}
 	}
 	return nil
 }
@@ -462,6 +581,119 @@ func ensureDirExists(path string) error {
 		return fmt.Errorf("path %s is not a directory", sanitized)
 	}
 	return nil
+}
+
+// checkDirExists verifies that path already exists and is a directory. It
+// never creates anything: storage.base_dir holds the originals, and silently
+// creating it would let a broken bind mount masquerade as an empty, healthy
+// base directory (and have its "orphaned" cache pruned as a result).
+func checkDirExists(path string) error {
+	sanitized := strings.TrimSpace(path)
+	if sanitized == "" {
+		return errors.New("path cannot be empty")
+	}
+	info, err := os.Stat(sanitized)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("directory %s does not exist", sanitized)
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path %s is not a directory", sanitized)
+	}
+	return nil
+}
+
+// validateStorageContainment rejects storage.base_dir/storage.cache_dir
+// combinations where one contains the other, they resolve to the same
+// directory, or either resolves to the filesystem root. base_dir is
+// expected to already exist (checked by checkDirExists); cache_dir may not
+// exist yet, so it is resolved against its nearest existing ancestor.
+func validateStorageContainment(baseDir, cacheDir string) error {
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return fmt.Errorf("resolve storage.base_dir %q: %w", baseDir, err)
+	}
+	absCache, err := filepath.Abs(cacheDir)
+	if err != nil {
+		return fmt.Errorf("resolve storage.cache_dir %q: %w", cacheDir, err)
+	}
+	resolvedBase, err := filepath.EvalSymlinks(absBase)
+	if err != nil {
+		return fmt.Errorf("resolve storage.base_dir %q: %w", baseDir, err)
+	}
+	resolvedCache, err := resolveExistingAncestor(absCache)
+	if err != nil {
+		return fmt.Errorf("resolve storage.cache_dir %q: %w", cacheDir, err)
+	}
+	root := string(filepath.Separator)
+	if resolvedBase == root {
+		return fmt.Errorf("storage.base_dir %q resolves to the filesystem root, which is not allowed", baseDir)
+	}
+	if resolvedCache == root {
+		return fmt.Errorf("storage.cache_dir %q resolves to the filesystem root, which is not allowed", cacheDir)
+	}
+	if resolvedBase == resolvedCache {
+		return fmt.Errorf("storage.cache_dir %q and storage.base_dir %q must not be the same directory", cacheDir, baseDir)
+	}
+	if isSubPath(resolvedBase, resolvedCache) {
+		return fmt.Errorf("storage.cache_dir %q must not be inside storage.base_dir %q", cacheDir, baseDir)
+	}
+	if isSubPath(resolvedCache, resolvedBase) {
+		return fmt.Errorf("storage.base_dir %q must not be inside storage.cache_dir %q", baseDir, cacheDir)
+	}
+	return nil
+}
+
+// resolveExistingAncestor resolves symlinks along path, walking up to the
+// nearest ancestor that actually exists (path itself may not exist yet),
+// then rejoins the non-existent trailing components onto the resolved base.
+func resolveExistingAncestor(path string) (string, error) {
+	current := path
+	var pending []string
+	for {
+		_, err := os.Lstat(current)
+		if err == nil {
+			resolved, evalErr := filepath.EvalSymlinks(current)
+			if evalErr != nil {
+				return "", evalErr
+			}
+			for i := len(pending) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, pending[i])
+			}
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the root without finding an existing ancestor.
+			return path, nil
+		}
+		pending = append(pending, filepath.Base(current))
+		current = parent
+	}
+}
+
+// isSubPath reports whether child is strictly inside parent (both already
+// absolute and symlink-resolved). Equal paths are not considered contained.
+func isSubPath(parent, child string) bool {
+	if parent == child {
+		return false
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
 }
 
 // ResolveOriginalPath resolves a request path against base dir ensuring no traversal.

@@ -16,11 +16,87 @@ import (
 const defaultMonitorWorkers = 4
 const defaultInvalidationLockTimeout = 100 * time.Millisecond
 
+// maxBootstrapPathFailures bounds how often one unreadable path is retried
+// before discovery stops hammering it every interval and puts it on a back-off.
+const maxBootstrapPathFailures = 10
+
+// bootstrapRetryIntervals is the first back-off of a path discovery has given up
+// on for now, counted in monitor intervals so that a deployment and a test scale
+// together. It doubles on every further round of failures.
+const bootstrapRetryIntervals = 10
+
+// maxBootstrapRetryBackoff caps that doubling: an unreadable subtree is retried
+// at least once an hour, because a permission problem is usually fixed from
+// outside the process.
+const maxBootstrapRetryBackoff = time.Hour
+
+// errOriginalsUnavailable defers a reference whose original cannot be judged
+// because the originals volume is missing or empty.
+var errOriginalsUnavailable = errors.New("originals directory missing or empty")
+
 // bootstrapState belongs to the discovery goroutine. Failed paths alone are retried.
 type bootstrapState struct {
 	previous    originalManifest
 	directories map[string]struct{}
 	references  map[string][]string
+	failures    map[string]int
+	// abandoned holds the paths that are waiting out a back-off. They stay in
+	// directories/references, so they keep discovery incomplete: a path that was
+	// dropped outright used to make discovery declare itself complete, which
+	// cleared every Unknown marker, released the retired entries and stopped the
+	// manifest from carrying the baselines of the subtree that was never read.
+	// One directory owned by another uid would then permanently degrade the
+	// index, with discovery gone for the lifetime of the process.
+	abandoned map[string]retrySchedule
+}
+
+// retrySchedule is the back-off of one abandoned path.
+type retrySchedule struct {
+	at      time.Time
+	backoff time.Duration
+}
+
+// fail records one more consecutive failure for a path and reports whether it
+// should be given up on for now.
+func (s *bootstrapState) fail(path string) bool {
+	if s.failures == nil {
+		s.failures = make(map[string]int)
+	}
+	s.failures[path]++
+	return s.failures[path] >= maxBootstrapPathFailures
+}
+
+// abandon puts a repeatedly failing path on a back-off. The path itself is kept
+// queued, so readiness keeps waiting for it; only the retry rate drops.
+func (s *bootstrapState) abandon(path string, interval time.Duration) time.Duration {
+	if s.abandoned == nil {
+		s.abandoned = make(map[string]retrySchedule)
+	}
+	backoff := s.abandoned[path].backoff
+	switch {
+	case backoff <= 0:
+		backoff = max(interval, time.Millisecond) * bootstrapRetryIntervals
+	default:
+		backoff *= 2
+	}
+	backoff = min(backoff, maxBootstrapRetryBackoff)
+	s.abandoned[path] = retrySchedule{at: time.Now().Add(backoff), backoff: backoff}
+	delete(s.failures, path)
+	return backoff
+}
+
+// waiting reports whether path is still inside its back-off. A due path keeps
+// its schedule until it succeeds, so the next failure doubles from where the
+// previous one left off.
+func (s *bootstrapState) waiting(path string, now time.Time) bool {
+	schedule, ok := s.abandoned[path]
+	return ok && now.Before(schedule.at)
+}
+
+// recovered clears the back-off history of a path that was read successfully.
+func (s *bootstrapState) recovered(path string) {
+	delete(s.failures, path)
+	delete(s.abandoned, path)
 }
 
 func (m *Manager) monitorWorkers() int {
@@ -222,12 +298,30 @@ func (m *Manager) pendingKeys() []string {
 	return keys
 }
 
+// markPendingLocked condemns everything registered for an original right now.
+// Variants published afterwards are produced from the current source and are not
+// part of the set, which is what lets a hot original leave the queue at all.
+// Caller holds indexMu.
 func (m *Manager) markPendingLocked(rel string, entry *trackedOriginal) {
-	if !entry.Pending {
-		entry.Pending = true
+	for path := range entry.Variants {
+		if _, ok := entry.Doomed[path]; ok {
+			continue
+		}
+		if entry.Doomed == nil {
+			entry.Doomed = make(map[string]struct{}, len(entry.Variants))
+		}
+		entry.Doomed[path] = struct{}{}
 		m.indexGeneration++
 	}
-	m.pendingOriginals[rel] = struct{}{}
+	// Variants discovery has not reached yet are stale too, and only this flag
+	// can say so once they show up.
+	if !m.indexReady && !entry.Unknown && m.cfg.Cache.CheckOriginalsInterval.Duration > 0 {
+		entry.Unknown = true
+		m.indexGeneration++
+	}
+	if len(entry.Doomed) > 0 {
+		m.pendingOriginals[rel] = struct{}{}
+	}
 }
 
 func (m *Manager) checkOriginal(ctx context.Context, rel string) error {
@@ -236,7 +330,7 @@ func (m *Manager) checkOriginal(ctx context.Context, rel string) error {
 	}
 	m.indexMu.RLock()
 	entry := m.originals[rel]
-	if entry == nil || entry.Pending {
+	if entry == nil || len(entry.Doomed) > 0 {
 		m.indexMu.RUnlock()
 		return nil
 	}
@@ -247,6 +341,12 @@ func (m *Manager) checkOriginal(ctx context.Context, rel string) error {
 		return fmt.Errorf("stat original %q: %w", rel, err)
 	}
 	if err == nil && info.Mode().IsRegular() && signatureFromInfo(info) == signature {
+		return nil
+	}
+	// A source that disappeared along with its whole volume is an unmount, not a
+	// deletion. Invalidating on that would empty the cache one original at a
+	// time, which is the same loss the cleanup pass is guarded against.
+	if errors.Is(err, os.ErrNotExist) && !m.originalsAvailableFor(rel) {
 		return nil
 	}
 	m.indexMu.Lock()
@@ -262,8 +362,11 @@ func (m *Manager) invalidatePending(ctx context.Context, key string) error {
 	// Bounds lock waiting and time between removal operations. It cannot interrupt a syscall.
 	taskCtx, cancel := context.WithTimeout(ctx, m.invalidationTimeout())
 	defer cancel()
+	if len(key) < 2 {
+		return fmt.Errorf("malformed invalidation key %q", key)
+	}
 	if key[:2] == "s:" {
-		_, err := m.invalidateOriginal(taskCtx, key[2:], false)
+		_, err := m.invalidateOriginal(taskCtx, key[2:], nil)
 		return err
 	}
 	path := key[2:]
@@ -330,14 +433,15 @@ func (m *Manager) parallelTasks(ctx context.Context, keys []string, work func(st
 			}
 		}()
 	}
+dispatch:
 	for _, key := range keys {
 		select {
 		case jobs <- key:
 		case <-ctx.Done():
-			break
+			break dispatch
 		}
 		if ctx.Err() != nil {
-			break
+			break dispatch
 		}
 	}
 	close(jobs)
@@ -369,6 +473,7 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 			previous:    previous,
 			directories: map[string]struct{}{m.cfg.Storage.CacheDir: {}},
 			references:  make(map[string][]string),
+			failures:    make(map[string]int),
 		}
 		m.indexMu.Lock()
 		m.previousManifest = previous
@@ -380,25 +485,47 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 		return nil
 	}
 	started := time.Now()
+	interval := m.cfg.Cache.CheckOriginalsInterval.Duration
 	directories := make([]string, 0, len(state.directories))
 	for path := range state.directories {
+		if state.waiting(path, started) {
+			continue
+		}
 		directories = append(directories, path)
 	}
 	sort.Strings(directories)
 	var firstErr error
 	failedDirs := 0
+	// A path that no longer exists is not a failure: cleanup prunes empty cache
+	// directories while discovery is walking them. Re-queueing those would keep
+	// discovery incomplete for the lifetime of the process.
+	deferPath := func(path string, err error) {
+		if errors.Is(err, os.ErrNotExist) {
+			delete(state.failures, path)
+			return
+		}
+		failedDirs++
+		if firstErr == nil {
+			firstErr = err
+		}
+		if state.fail(path) {
+			backoff := state.abandon(path, interval)
+			m.logger.Warn("deferring cache directory after repeated failures; discovery stays incomplete",
+				slog.String("path", path), slog.Int("attempts", maxBootstrapPathFailures),
+				slog.Duration("retry_in", backoff), slog.Any("error", err))
+		}
+		state.directories[path] = struct{}{}
+	}
 	for _, root := range directories {
 		delete(state.directories, root)
+		deferred := false
 		walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if err != nil {
-				state.directories[path] = struct{}{}
-				failedDirs++
-				if firstErr == nil {
-					firstErr = err
-				}
+				deferred = deferred || path == root
+				deferPath(path, err)
 				return nil // WalkDir continues with accessible siblings.
 			}
 			if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !isAllowedCacheExt(path) {
@@ -418,17 +545,31 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 			return nil
 		})
 		if walkErr != nil {
-			state.directories[root] = struct{}{}
 			if ctx.Err() != nil {
+				state.directories[root] = struct{}{}
 				return ctx.Err()
 			}
-			if firstErr == nil {
-				firstErr = walkErr
-			}
+			deferPath(root, walkErr)
+			deferred = true
 		}
+		if !deferred {
+			state.recovered(root)
+		}
+	}
+	// An unmounted or empty originals volume makes every cached file look like an
+	// orphan. Defer those references instead of queueing the whole cache for
+	// deletion; discovery stays incomplete until the volume is back.
+	m.forgetProbes()
+	orphansAllowed := m.originalsRootPopulatedCached()
+	if !orphansAllowed {
+		m.logger.Warn("originals directory missing or empty; deferring orphan invalidation",
+			slog.String("base_dir", m.cfg.Storage.BaseDir))
 	}
 	references := make([]string, 0, len(state.references))
 	for rel := range state.references {
+		if state.waiting(rel, started) {
+			continue
+		}
 		references = append(references, rel)
 	}
 	sort.Strings(references)
@@ -436,12 +577,24 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 	var doneMu sync.Mutex
 	var done []string
 	referenceErr := m.parallelTasks(ctx, references, func(rel string) error {
-		if err := m.indexCacheReference(ctx, rel, state.references[rel], state.previous); err != nil {
+		err := m.indexCacheReference(ctx, rel, state.references[rel], state.previous)
+		doneMu.Lock()
+		defer doneMu.Unlock()
+		switch {
+		case errors.Is(err, errOriginalsUnavailable):
+			// Deferred, not failed: keep the reference for a later attempt.
+			return nil
+		case err != nil:
+			if state.fail(rel) {
+				backoff := state.abandon(rel, interval)
+				m.logger.Warn("deferring cache reference after repeated failures; discovery stays incomplete",
+					slog.String("path", rel), slog.Int("attempts", maxBootstrapPathFailures),
+					slog.Duration("retry_in", backoff), slog.Any("error", err))
+			}
 			return err
 		}
-		doneMu.Lock()
+		state.recovered(rel)
 		done = append(done, rel)
-		doneMu.Unlock()
 		return nil
 	})
 	for _, rel := range done {
@@ -458,6 +611,9 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 			// No unresolved cache references remain; active entries now own all
 			// remaining invalidations and retired history can be released.
 			m.bootstrapRetired = nil
+			for _, entry := range m.originals {
+				entry.Unknown = false
+			}
 		}
 		m.indexGeneration++
 	}
@@ -466,6 +622,7 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 	m.logger.Info("cache discovery progress", slog.Bool("complete", ready),
 		slog.Int("originals", stats.Originals), slog.Int("variants", stats.Variants),
 		slog.Int("retry_directories", len(state.directories)), slog.Int("retry_references", len(state.references)),
+		slog.Int("backing_off", len(state.abandoned)),
 		slog.Duration("duration", time.Since(started)))
 	if firstErr != nil {
 		firstErr = fmt.Errorf("%d directory errors; first: %w", failedDirs, firstErr)
@@ -478,6 +635,12 @@ func (m *Manager) indexCacheReference(ctx context.Context, cacheRel string, path
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("resolve %q: %w", cacheRel, err)
+		}
+		// Asked per reference rather than once per pass: discovery over a large
+		// cache runs long enough for the volume to disappear inside it, and each
+		// nested mount under base_dir can be missing on its own.
+		if !m.originalsAvailableFor(cacheRel) {
+			return errOriginalsUnavailable
 		}
 		m.indexMu.Lock()
 		for _, path := range paths {

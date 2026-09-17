@@ -45,7 +45,9 @@ func TestLoadFromEnvOrFileLegacyEnv(t *testing.T) {
 	baseDir := t.TempDir()
 	cacheDir := filepath.Join(t.TempDir(), "cache")
 
-	t.Setenv("HOST", "127.0.0.1")
+	// HOST is no longer honored unprefixed (config-validation brief item 3);
+	// FARS_HOST is the supported way to override the bind address.
+	t.Setenv("FARS_HOST", "127.0.0.1")
 	t.Setenv("PORT", "9091")
 	t.Setenv("IMAGES_BASE_DIR", baseDir)
 	t.Setenv("CACHE_DIR", cacheDir)
@@ -100,7 +102,9 @@ func TestLoadFromEnvOrFileLegacyEnv(t *testing.T) {
 }
 
 func TestLoadFromEnvOrFileWithPrefixedKeys(t *testing.T) {
-	baseDir := filepath.Join(t.TempDir(), "prefixed-base")
+	// storage.base_dir must already exist (config-validation brief item 1),
+	// so it's t.TempDir() directly rather than a not-yet-created subdirectory.
+	baseDir := t.TempDir()
 	cacheDir := filepath.Join(t.TempDir(), "prefixed-cache")
 
 	t.Setenv("FARS_SERVER__HOST", "0.0.0.0")

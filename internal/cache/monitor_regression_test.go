@@ -35,7 +35,11 @@ func TestNewVariantCannotHideChangedOriginal(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNotExists(t, old)
-	assertNotExists(t, newer)
+	// The variant published from the changed source is the new baseline: it is
+	// not invalidated along with the ones that predate it.
+	if data, err := os.ReadFile(newer); err != nil || string(data) != "new resize" {
+		t.Fatalf("invalidation removed the variant published from the current source: %q, %v", data, err)
+	}
 }
 
 func TestFailedInvalidationRemainsPendingAndRetries(t *testing.T) {

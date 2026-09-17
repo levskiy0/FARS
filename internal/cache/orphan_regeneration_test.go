@@ -9,6 +9,8 @@ import (
 func TestQueuedOrphanCannotDeleteRegeneratedResize(t *testing.T) {
 	m, base, cacheDir := newTestManager(t)
 	rel := "img/photo.jpg"
+	// Orphan deletion is skipped while the originals root looks unmounted.
+	writeTestFile(t, base, "img/present.jpg", []byte("unrelated original"))
 	path := writeTestFile(t, cacheDir, "200x200/"+rel, []byte("orphan"))
 	if err := m.bootstrapIndex(context.Background()); err != nil {
 		t.Fatal(err)

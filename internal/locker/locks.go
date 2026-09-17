@@ -43,7 +43,15 @@ func (k *KeyedLocker) LockContext(ctx context.Context, key string) (func(), erro
 			k.release(key, item)
 			return nil, err
 		}
-		return func() { item.token <- struct{}{}; k.release(key, item) }, nil
+		// A release closure may be handed to several owners (defer plus an explicit
+		// call); releasing twice would refill the token channel and wedge the key.
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				item.token <- struct{}{}
+				k.release(key, item)
+			})
+		}, nil
 	}
 }
 

@@ -111,7 +111,10 @@ func TestWriteRegistersVariantAndManualInvalidationRemovesIt(t *testing.T) {
 }
 
 func TestBootstrapRemovesOrphanVariant(t *testing.T) {
-	manager, _, cacheDir := newTestManager(t)
+	manager, baseDir, cacheDir := newTestManager(t)
+	// Orphan deletion is skipped while the originals root looks unmounted, so
+	// the directory has to hold something unrelated for this case to apply.
+	writeTestFile(t, baseDir, "img/present.jpg", []byte("original"))
 	variant := writeTestFile(t, cacheDir, "200x200/img/missing.jpg.webp", []byte("resize"))
 
 	if err := bootstrapForTest(manager); err != nil {
