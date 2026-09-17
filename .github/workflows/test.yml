@@ -1,0 +1,57 @@
+name: Test
+
+# main is covered by docker-build-push.yml, which calls this workflow before it
+# publishes the image — listing main here too would run the whole suite twice
+# for one push. develop has no image build, so it needs its own trigger.
+on:
+  push:
+    branches: [ develop ]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # cgo/bimg links against libvips; the runtime image gets the same
+      # libraries from trixie, see Dockerfile.
+      - name: Install libvips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvips-dev libheif-plugin-aomenc libheif-plugin-dav1d
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal ./pkg ./tests)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+      - name: Test (race, including integration-tagged)
+        run: go test -race -tags=integration ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
