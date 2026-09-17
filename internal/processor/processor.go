@@ -48,6 +48,9 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 	if len(source) == 0 {
 		return nil, fmt.Errorf("source payload is empty")
 	}
+	if converted := toSRGB(source); converted != nil {
+		source = converted
+	}
 	img := bimg.NewImage(source)
 
 	size, err := img.Size()
@@ -224,6 +227,35 @@ func buildBaseOptions(opts Options) (bimg.Options, error) {
 		return bimg.Options{}, fmt.Errorf("unsupported format %q", opts.Format)
 	}
 	return options, nil
+}
+
+// toSRGB converts a source that libvips does not read as RGB — in practice a
+// CMYK JPEG straight out of a print workflow — into sRGB, and returns nil when
+// the source is already fine or cannot be converted.
+//
+// bimg only applies the interpretation at save time, so every step before that
+// (flatten, embed, background) sees the raw band count. A CMYK image has four
+// bands, which makes bimg's vipsHasAlpha treat it as having alpha and hand
+// vips_flatten a three-element background vector; libvips then fails the whole
+// render with "linear: vector must have 1 or 4 elements" and the request 500s.
+func toSRGB(source []byte) []byte {
+	interpretation, err := bimg.NewImage(source).Interpretation()
+	if err != nil {
+		return nil
+	}
+
+	switch interpretation {
+	case bimg.InterpretationSRGB, bimg.InterpretationRGB, bimg.InterpretationBW:
+		return nil
+	}
+
+	// Best effort: an unconvertible source is no worse off than before.
+	converted, err := bimg.NewImage(source).Colourspace(bimg.InterpretationSRGB)
+	if err != nil {
+		return nil
+	}
+
+	return converted
 }
 
 // flattenToWhite composites the image onto a white background, removing transparency.

@@ -175,3 +175,87 @@ func TestResizeDownscaleFitsWithinCanvas(t *testing.T) {
 		t.Fatalf("expected transparent padding at top edge, got alpha=%d", top.A)
 	}
 }
+
+// cmykJPEG builds a small CMYK JPEG — the colourspace a print-ready banner
+// arrives in when someone uploads it to a CMS block.
+func cmykJPEG(t *testing.T, width, height int) []byte {
+	t.Helper()
+
+	src := image.NewNRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(src, src.Bounds(), &image.Uniform{color.NRGBA{R: 20, G: 90, B: 160, A: 255}}, image.Point{}, draw.Src)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		t.Fatalf("encode source png: %v", err)
+	}
+
+	cmyk, err := bimg.NewImage(buf.Bytes()).Process(bimg.Options{
+		Type:           bimg.JPEG,
+		Quality:        90,
+		Interpretation: bimg.InterpretationCMYK,
+	})
+	if err != nil {
+		t.Skipf("libvips cannot produce a CMYK jpeg here: %v", err)
+	}
+
+	interpretation, err := bimg.NewImage(cmyk).Interpretation()
+	if err != nil {
+		t.Fatalf("read interpretation: %v", err)
+	}
+	if interpretation != bimg.InterpretationCMYK {
+		t.Skipf("libvips produced %v, not CMYK", interpretation)
+	}
+
+	return cmyk
+}
+
+func TestToSRGBConvertsCMYK(t *testing.T) {
+	source := cmykJPEG(t, 600, 300)
+
+	converted := toSRGB(source)
+	if converted == nil {
+		t.Fatal("expected a CMYK source to be converted, got nil")
+	}
+
+	interpretation, err := bimg.NewImage(converted).Interpretation()
+	if err != nil {
+		t.Fatalf("read converted interpretation: %v", err)
+	}
+	if interpretation != bimg.InterpretationSRGB {
+		t.Fatalf("got interpretation %v, want sRGB", interpretation)
+	}
+
+	// And the converted payload still survives the resize pipeline that the
+	// raw CMYK one used to fail on ("linear: vector must have 1 or 4 elements").
+	result, err := New().Resize(source, Options{
+		Width:          382,
+		Format:         FormatJPEG,
+		JPEGQuality:    80,
+		WebPQuality:    75,
+		AVIFQuality:    70,
+		AVIFSpeed:      8,
+		PNGCompression: 6,
+		EnsureOpaque:   true,
+	})
+	if err != nil {
+		t.Fatalf("Resize returned error: %v", err)
+	}
+	size, err := bimg.NewImage(result).Size()
+	if err != nil {
+		t.Fatalf("inspect result: %v", err)
+	}
+	if size.Width != 382 {
+		t.Fatalf("got width %d, want 382", size.Width)
+	}
+}
+
+func TestToSRGBLeavesRGBSourceAlone(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 8, 8))
+	draw.Draw(src, src.Bounds(), &image.Uniform{color.NRGBA{R: 10, G: 20, B: 30, A: 255}}, image.Point{}, draw.Src)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		t.Fatalf("encode source png: %v", err)
+	}
+	if got := toSRGB(buf.Bytes()); got != nil {
+		t.Fatalf("expected an sRGB source to be left untouched, got %d bytes back", len(got))
+	}
+}
