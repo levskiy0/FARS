@@ -130,6 +130,7 @@ unregisters the route entirely.
 | `fars_originals_tracked` | gauge | originals the monitor watches |
 | `fars_originals_changed_total`, `fars_originals_check_errors_total` | counter | sources seen to change; checks that failed and were deferred |
 | `fars_invalidations_total{result}` | counter | manual invalidation calls |
+| `fars_gomaxprocs`, `fars_vips_concurrency`, `fars_cpu_quota` | gauge | the CPU settings in force and the cgroup limit they are measured against — `fars_gomaxprocs > fars_cpu_quota` is the throttling condition, and it alerts instead of being checked by hand |
 | `fars_build_info{version,go_version}` | gauge | always 1, for joining a dashboard to a build |
 
 Plus the standard `go_*` and `process_*` collectors. The request path is never
@@ -186,7 +187,8 @@ Sample `config.yaml`:
 server:
   host: 0.0.0.0
   port: 9090
-  trusted_proxies: [] # e.g. ["10.0.0.0/8"]; empty trusts no proxy
+  # default: loopback + the private ranges; [] believes no proxy at all
+  trusted_proxies: ["127.0.0.1/32", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
 storage:
   base_dir: "/var/www/prestashop/img"
@@ -195,22 +197,22 @@ storage:
 resize:
   max_width: 2000
   max_height: 2000
-  jpg_quality: 80
-  webp_quality: 75
-  avif_quality: 45
+  jpg_quality: 77
+  webp_quality: 65
+  avif_quality: 50
   avif_speed: 6
   png_compression: 6
 
 cache:
-  ttl: "30d"
-  cleanup_interval: "24h"
+  ttl: "10d"
+  cleanup_interval: "12h"
   check_originals_interval: "5m"
   check_originals_workers: 4
   invalidation_lock_timeout: "100ms"
   invalidation_token: "" # empty disables both manual invalidation routes
-  max_size: "" # e.g. "50gb"; empty or 0 disables size-based eviction
+  max_size: "50gb" # 0 disables size eviction; the cache is then bounded only by ttl
 
-runtime:
+runtime:      # all three derive themselves; see CPU settings below
   gomaxprocs: 0
   vips_concurrency: 0
   resize_concurrency: 0
@@ -233,12 +235,35 @@ Key points:
 - `cache.max_size` caps the total size of `cache_dir`. Eviction runs after the TTL pass and removes least-recently-used entries until the cache is back under the cap. Empty or `0` means no cap, and the cache is then bounded only by `ttl` — since every distinct geometry writes a new file, an unauthenticated client can fill the volume. Set it in production.
 - Setting a cap also changes what `ttl` measures. With no cap, a variant's mtime is its publication time, so `ttl` expires it that long after it was generated. With a cap, a cache hit refreshes the variant's mtime (at most once an hour, so it costs nothing on a hot path), which makes both `ttl` and size eviction act on time since last use — the recency an image cache actually wants, and the reason eviction doesn't throw away the catalogue images every page loads.
 - `storage.base_dir` must already exist: FARS refuses to start otherwise instead of creating it. A missing bind mount used to produce an empty directory, a service that looked healthy, and a cleanup pass that deleted the whole variant cache as "orphans". `cache_dir` is still created on demand, and the two directories may not overlap (neither may be `/`, contain the other, or be the same path).
-- `runtime.gomaxprocs` and `runtime.vips_concurrency` allow tuning Go scheduler threads and libvips worker pool (0 keeps library defaults).
-- `runtime.resize_concurrency` caps how many resizes run at once; `0` means one per `GOMAXPROCS`. Keep it separate from `vips_concurrency`: that one sizes the thread pool *inside* a single libvips operation and is deliberately set to 1 or 2 in production, which is not a sensible number of concurrent requests.
+- `cache.max_size` defaults to `50gb`. The alternative default is "grow until the volume is full", since every distinct geometry writes another file and only `ttl` removes them. Raise it on a bigger disk; `0` restores unbounded growth deliberately.
+- `runtime.resize_concurrency` caps how many resizes run at once; `0` means one per `GOMAXPROCS`. Keep it separate from `vips_concurrency`: that one sizes the thread pool *inside* a single libvips operation, which is not a number of concurrent requests.
 - `metrics.enabled`, `metrics.path` and `metrics.listen` configure the Prometheus endpoint — see [Monitoring](#monitoring). `metrics.path` is rejected at startup if it collides with the `/resize`, `/cache` or `/cclear` routes, since gin would panic on the overlap instead of reporting it.
 - `logging.level`, `logging.format` and `logging.access` configure log output.
 - `server.trusted_proxies` lists the reverse proxies (IPs or CIDRs) whose `X-Forwarded-For` may be believed, which is what the access log's `remote_ip` reports. Empty (the default) trusts none, so `remote_ip` is the peer that opened the connection — with Angie in front, that is Angie. Set it to the proxy's address to see real client IPs; never widen it to a range that reaches untrusted clients, or they can forge `remote_ip`.
 - Rewrite rules are evaluated sequentially; the first matching pattern rewrites the path and stops the chain.
+
+### CPU settings
+
+Leave `runtime.gomaxprocs` and `runtime.vips_concurrency` at `0`. Both derive
+themselves at startup, and both exist because the two libraries underneath
+count CPUs differently:
+
+- **Go** has read the cgroup CPU quota since 1.25, so a container limited to
+  `cpus: 6` on a 64-core host gets `GOMAXPROCS=6` without being told, and keeps
+  tracking the limit if it changes. Setting the value by hand replaces that and
+  freezes it, so the number has to be kept in step with the compose file by
+  somebody remembering to. A value above the detected limit is logged as a
+  warning at startup — more schedulable threads than the quota can run means
+  the kernel stops the process part of every scheduling period.
+- **libvips** counts the host's CPUs and ignores the quota entirely, so left
+  alone it starts a thread pool sized for the machine inside a container that
+  may only run a fraction of it. FARS therefore always sets it explicitly;
+  `0` means one thread per operation, which puts the parallelism across
+  requests (`resize_concurrency`) rather than inside a single resize.
+
+Both effective values are published as `fars_gomaxprocs` and
+`fars_vips_concurrency`, and logged at startup, so the check is a query rather
+than an `exec` into the container.
 
 ### Environment Overrides
 

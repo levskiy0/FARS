@@ -193,27 +193,48 @@ func defaultConfig() *Config {
 		Server: ServerConfig{
 			Host: "0.0.0.0",
 			Port: 8080,
+			// FARS sits behind a reverse proxy on a private network. Believing
+			// X-Forwarded-For from private peers is what makes remote_ip the
+			// visitor rather than the proxy; a client on the public internet
+			// cannot reach this list, because its source address is public.
+			// Narrow it to the proxy's own address if FARS shares a private
+			// network with anything untrusted.
+			TrustedProxies: []string{"127.0.0.1/32", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 		},
 		Storage: StorageConfig{
 			BaseDir:  "/data/base",
 			CacheDir: "/data/cache",
 		},
+		// The encoder settings are the ones the Citimarine storefront runs
+		// on, arrived at by looking at what the crawlers actually pull and
+		// what the files cost: below these the artefacts start showing on
+		// product photography, above them the bytes buy nothing visible.
 		Resize: ResizeConfig{
 			MaxWidth:       2000,
 			MaxHeight:      2000,
-			JPGQuality:     80,
-			WebPQuality:    75,
-			AVIFQuality:    75,
+			JPGQuality:     77,
+			WebPQuality:    65,
+			AVIFQuality:    50,
 			PNGCompression: 6,
 			AVIFSpeed:      6,
 		},
 		Cache: CacheConfig{
-			TTL:                     Duration{30 * 24 * time.Hour}, // 30d
-			CleanupInterval:         Duration{24 * time.Hour},      // 24h
+			TTL:                     Duration{10 * 24 * time.Hour}, // 10d
+			CleanupInterval:         Duration{12 * time.Hour},
 			CheckOriginalsInterval:  Duration{5 * time.Minute},
 			CheckOriginalsWorkers:   4,
 			InvalidationLockTimeout: Duration{100 * time.Millisecond},
+			// A cap, because the alternative default is "grow until the
+			// volume is full": every distinct geometry writes another file and
+			// nothing but ttl removes them. 50gb is the same order as the
+			// originals tree it serves; a deployment with a bigger disk should
+			// raise it, and "0" restores unbounded growth deliberately.
+			MaxSize: ByteSize{Bytes: 50 << 30},
 		},
+		// gomaxprocs and vips_concurrency stay 0: the Go runtime reads the
+		// cgroup CPU quota itself, and libvips is pinned to a single thread
+		// per operation by applyRuntimeTuning. Pinning either by hand is how
+		// a container ends up oversubscribing its own quota.
 		Runtime: RuntimeConfig{},
 		Metrics: MetricsConfig{
 			Enabled: true,

@@ -2,9 +2,11 @@ package config
 
 import (
 	"log/slog"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestObservabilityDefaults(t *testing.T) {
@@ -163,5 +165,60 @@ func TestValidateObservability(t *testing.T) {
 				t.Fatalf("Validate() = %v, want an error containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestDefaultsAreTheDeployedValues pins the built-in defaults to what the
+// Citimarine storefront runs on, so a deployment that ships no config file
+// behaves like the one that does. The encoder numbers in particular were
+// arrived at by measurement; a silent drift back to library defaults would
+// change every image the service produces.
+func TestDefaultsAreTheDeployedValues(t *testing.T) {
+	cfg := defaultConfig()
+
+	if cfg.Resize.JPGQuality != 77 || cfg.Resize.WebPQuality != 65 || cfg.Resize.AVIFQuality != 50 {
+		t.Errorf("encoder quality defaults = %d/%d/%d, want 77/65/50 (jpg/webp/avif)",
+			cfg.Resize.JPGQuality, cfg.Resize.WebPQuality, cfg.Resize.AVIFQuality)
+	}
+	if cfg.Resize.AVIFSpeed != 6 {
+		t.Errorf("avif_speed = %d, want 6: 3 costs several times the CPU per AVIF for a few percent of size", cfg.Resize.AVIFSpeed)
+	}
+	if cfg.Cache.TTL.Duration != 10*24*time.Hour {
+		t.Errorf("ttl = %s, want 240h", cfg.Cache.TTL)
+	}
+	if cfg.Cache.CleanupInterval.Duration != 12*time.Hour {
+		t.Errorf("cleanup_interval = %s, want 12h", cfg.Cache.CleanupInterval)
+	}
+	// Unbounded by default is how a cache fills a volume: every distinct
+	// geometry writes another file and only ttl removes them.
+	if cfg.Cache.MaxSize.Bytes != 50<<30 {
+		t.Errorf("max_size = %d bytes, want 50gb", cfg.Cache.MaxSize.Bytes)
+	}
+	// Zero, not a hand-maintained core count: the Go runtime reads the cgroup
+	// quota itself and applyRuntimeTuning pins libvips to one thread.
+	if cfg.Runtime.GOMAXPROCS != 0 || cfg.Runtime.VIPSConcurrency != 0 || cfg.Runtime.ResizeConcurrency != 0 {
+		t.Errorf("runtime defaults = %+v, want all zero (derived at startup)", cfg.Runtime)
+	}
+	if len(cfg.Server.TrustedProxies) == 0 {
+		t.Error("no trusted proxies by default; remote_ip would be the reverse proxy on every line")
+	}
+	if err := cfg.Validate(); err != nil && !strings.Contains(err.Error(), "storage.") {
+		t.Errorf("the defaults do not validate: %v", err)
+	}
+}
+
+// TestDefaultTrustedProxiesBelieveOnlyPrivatePeers is the safety argument for
+// the default above: a client reaching FARS over the internet arrives with a
+// public source address, which is not on this list, so it cannot forge its own
+// remote_ip.
+func TestDefaultTrustedProxiesBelieveOnlyPrivatePeers(t *testing.T) {
+	for _, cidr := range defaultConfig().Server.TrustedProxies {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			t.Fatalf("default trusted proxy %q does not parse: %v", cidr, err)
+		}
+		if !network.IP.IsPrivate() && !network.IP.IsLoopback() {
+			t.Errorf("default trusts %q, which is neither private nor loopback", cidr)
+		}
 	}
 }

@@ -96,9 +96,13 @@ Defaults baked into the image:
 | `PORT` | `9090` | listen port |
 | `IMAGES_BASE_DIR` | `/app/data/images` | originals root; must already exist |
 | `CACHE_DIR` | `/app/data/cache` | cache root; created on demand |
-| `TTL` | `24h` | how long a cached variant survives |
-| `CLEANUP_INTERVAL` | `10m` | how often the TTL pass runs |
 | `TZ` | `Etc/UTC` | |
+
+The image sets nothing else. Environment beats YAML in the loader, so a tuning
+value baked into the image would silently overrule a mounted config file —
+which is what an earlier `TTL=24h` in this image did to deployments that had
+set `ttl: 10d` in their config. Retention and encoder settings come from your
+config file, or from the defaults below.
 
 Other common settings (legacy shortcut on the left, all also reachable as
 `FARS_…`):
@@ -106,15 +110,17 @@ Other common settings (legacy shortcut on the left, all also reachable as
 | Variable | Default | Meaning |
 |---|---|---|
 | `MAX_WIDTH`, `MAX_HEIGHT` | `2000` | geometry ceiling; beyond it the request is a `400` |
-| `JPG_QUALITY`, `WEBP_QUALITY`, `AVIF_QUALITY` | `80`, `75`, `75` | encoder quality |
+| `TTL` | `10d` | how long a cached variant survives |
+| `CLEANUP_INTERVAL` | `12h` | how often the TTL pass runs |
+| `JPG_QUALITY`, `WEBP_QUALITY`, `AVIF_QUALITY` | `77`, `65`, `50` | encoder quality, measured on product photography |
 | `AVIF_SPEED` | `6` | libheif AVIF effort, 0 slowest/best … 8 fastest |
 | `PNG_COMPRESSION` | `6` | zlib level |
-| `MAX_CACHE_SIZE` | unset | total cache cap, e.g. `50gb`. **Set this** — unset means the cache is bounded only by TTL, and every distinct geometry writes another file |
+| `MAX_CACHE_SIZE` | `50gb` | total cache cap. `0` disables size eviction, and the cache is then bounded only by TTL while every distinct geometry writes another file. Raise it on a bigger disk |
 | `CHECK_ORIGINALS_INTERVAL` | `5m` | how often tracked originals are re-checked |
 | `INVALIDATION_TOKEN` | empty | bearer token; empty disables both invalidation routes |
 | `RESIZE_CONCURRENCY` | `0` | concurrent resizes; `0` = one per `GOMAXPROCS` |
-| `VIPS_CONCURRENCY` | `0` | threads *inside* one libvips operation — not a request-concurrency knob |
-| `GOMAXPROCS` | `0` | Go scheduler threads |
+| `VIPS_CONCURRENCY` | `0` | threads *inside* one libvips operation; `0` means 1. Not a request-concurrency knob |
+| `GOMAXPROCS` | `0` | `0` lets the Go runtime read the container's CPU quota — see below |
 | `FARS_SERVER__TRUSTED_PROXIES` | empty | proxies (IPs or CIDRs) whose `X-Forwarded-For` is believed. Empty logs the connecting peer, i.e. your reverse proxy |
 | `FARS_METRICS__ENABLED` | `true` | serve Prometheus metrics |
 | `FARS_METRICS__PATH` | `/metrics` | where they are served |
@@ -127,6 +133,24 @@ Rewrite rules (regex → replacement, first match wins) let a public URL differ
 from the path on disk; they are configured in YAML only. The sample config in
 the repository ships the PrestaShop set, which maps `12-large_default/name.jpg`
 to `img/p/1/2/12.jpg`.
+
+## CPU
+
+Leave `GOMAXPROCS` and `VIPS_CONCURRENCY` unset. Go reads the container's CPU
+quota itself, so `--cpus=6` gives `GOMAXPROCS=6` on a 64-core host without
+being told, and keeps tracking the limit if it changes; pinning the value by
+hand replaces that and has to be kept in step with the limit by somebody
+remembering to. libvips, by contrast, counts the *host's* CPUs and ignores the
+quota, so FARS always sets it explicitly — one thread per operation, with the
+parallelism across requests instead.
+
+A `GOMAXPROCS` above the container's quota is logged as a warning at startup —
+more runnable threads than the quota can serve means the kernel stops the
+process for the rest of every scheduling period. FARS reads the quota from the
+cgroup rather than from the runtime, because a `GOMAXPROCS` variable overrides
+it inside the runtime. The effective values are published as `fars_gomaxprocs`,
+`fars_vips_concurrency` and `fars_cpu_quota`, so `fars_gomaxprocs >
+fars_cpu_quota` can alert.
 
 ## Geometry
 
@@ -181,8 +205,9 @@ Batch requests are limited to 64 KiB and 1000 paths.
 
 - Mount the originals read-only. FARS never writes to them, and the cache is the
   only volume that needs to be writable.
-- Set `MAX_CACHE_SIZE`. With a cap in place a cache hit refreshes the entry's
-  mtime (at most hourly), so both eviction and TTL measure time since last use.
+- Check `MAX_CACHE_SIZE` against the volume you gave the cache. With a cap in
+  place a cache hit refreshes the entry's mtime (at most hourly), so both
+  eviction and TTL measure time since last use.
 - The originals root must exist at startup — FARS refuses to start rather than
   create it, because an unmounted volume would otherwise look healthy and the
   cleanup pass would delete the whole cache as orphans. The two directories may

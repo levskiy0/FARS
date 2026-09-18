@@ -56,12 +56,15 @@ WORKDIR /app
 COPY --from=builder --chown=fars:fars /out/fars /app/fars
 USER fars
 
+# Only what describes this image's own filesystem and port. Tuning values are
+# deliberately absent: environment beats YAML in the loader, so a TTL baked in
+# here would silently overrule the ttl in a mounted config file — which is
+# exactly what happened with the previous 24h/10m defaults. Retention now comes
+# from the config file, or from the built-in defaults when there is none.
 ENV TZ=Etc/UTC \
     PORT=9090 \
     IMAGES_BASE_DIR=/app/data/images \
-    CACHE_DIR=/app/data/cache \
-    TTL=24h \
-    CLEANUP_INTERVAL=10m
+    CACHE_DIR=/app/data/cache
 
 EXPOSE 9090
 ENTRYPOINT ["/app/fars","serve"]

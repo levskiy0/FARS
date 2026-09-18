@@ -2,9 +2,12 @@ server:
   host: 0.0.0.0
   port: 9090
   # Reverse proxies whose X-Forwarded-For may be believed (IPs or CIDRs).
-  # Empty trusts none: remote_ip in the access log is then the peer that
-  # opened the connection, i.e. Angie rather than the visitor.
-  trusted_proxies: []
+  # The default is loopback plus the private ranges, which is what makes
+  # remote_ip the visitor rather than the proxy in front. A client on the
+  # internet arrives with a public source address and so cannot forge it.
+  # Narrow this to the proxy's own address if FARS shares a private network
+  # with anything untrusted; [] believes nobody.
+  trusted_proxies: ["127.0.0.1/32", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
 # Prometheus exposition. Enabled by default on the API listener; set `listen`
 # to move it to its own host:port when only that port should be reachable from
@@ -30,30 +33,40 @@ storage:
 resize:
   max_width: 2000
   max_height: 2000
-  jpg_quality: 80
-  webp_quality: 75
-  avif_quality: 70
-  avif_speed: 8
+  # Measured on product photography: below these the artefacts start to show,
+  # above them the extra bytes buy nothing visible.
+  jpg_quality: 77
+  webp_quality: 65
+  avif_quality: 50
+  # 6, not 3: 3 costs several times the CPU per AVIF for a few percent of file
+  # size, and AVIF is what the crawlers pull hardest.
+  avif_speed: 6
   png_compression: 6
 
 cache:
-  ttl: "30d"
-  cleanup_interval: "24h"
+  ttl: "10d"
+  cleanup_interval: "12h"
   check_originals_interval: "5m"
   check_originals_workers: 4
   invalidation_lock_timeout: "100ms"
   invalidation_token: ""
-  # Total cache size cap, e.g. "50gb". Empty or 0 disables size eviction and
-  # the cache is bounded only by ttl — an unauthenticated client can then fill
-  # the volume by requesting arbitrary geometries. Set this in production.
+  # Total cache size cap. 0 disables size eviction and the cache is then
+  # bounded only by ttl — every distinct geometry writes another file, so an
+  # unauthenticated client can fill the volume. Raise it on a bigger disk.
   # With a cap set, a cache hit refreshes the entry's mtime (hourly at most),
   # so both eviction and ttl measure time since last use rather than age.
-  max_size: ""
+  max_size: "50gb"
 
+# All three derive themselves at startup. Setting them by hand is how a
+# container ends up asking for more threads than its CPU quota can run.
 runtime:
+  # 0 lets the Go runtime read the cgroup CPU quota, which it also keeps
+  # tracking if the limit changes. A value above the quota is logged as a
+  # warning at startup and published as fars_gomaxprocs.
   gomaxprocs: 0
-  # Threads *inside* one libvips operation. Deployments keep this at 1-2 on
-  # purpose; it is not a request-concurrency setting.
+  # Threads *inside* one libvips operation, where libvips would otherwise
+  # count the host's CPUs and ignore the container's limit. 0 means 1:
+  # parallelism belongs across requests, not inside one operation.
   vips_concurrency: 0
   # How many resizes may run at once. 0 = one per gomaxprocs.
   resize_concurrency: 0
