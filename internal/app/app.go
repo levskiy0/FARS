@@ -17,7 +17,7 @@ import (
 
 // Build constructs an fx application configured with all dependencies.
 func Build(cfg *config.Config) *fx.App {
-	logger := newLogger()
+	logger := newLogger(cfg)
 	applyRuntimeTuning(logger, cfg)
 
 	return fx.New(
@@ -38,8 +38,19 @@ func Build(cfg *config.Config) *fx.App {
 	)
 }
 
-func newLogger() *slog.Logger {
-	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+func newLogger(cfg *config.Config) *slog.Logger {
+	logging := config.LoggingConfig{Level: "info", Format: "text"}
+	if cfg != nil {
+		logging = cfg.Logging
+	}
+	opts := &slog.HandlerOptions{Level: logging.LevelSlog()}
+	// Text is the default because it is what the deployed log pipeline parses
+	// today: promtail keys FARS lines off `level=INFO`. Switching a deployment
+	// to json means changing that pipeline in the same breath.
+	var handler slog.Handler = slog.NewTextHandler(os.Stdout, opts)
+	if logging.JSON() {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	}
 	return slog.New(handler)
 }
 

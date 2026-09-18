@@ -20,6 +20,7 @@ import (
 
 	"fars/internal/config"
 	"fars/internal/locker"
+	"fars/internal/metrics"
 	"fars/pkg/human"
 )
 
@@ -163,6 +164,7 @@ func (m *Manager) SetMaxCacheSize(limit int64) {
 		limit = 0
 	}
 	m.maxCacheSize.Store(limit)
+	metrics.CacheSizeLimitBytes.Set(float64(limit))
 }
 
 // LockOriginal serializes generation and invalidation for one source image.
@@ -243,16 +245,23 @@ func (m *Manager) noteCacheHit(path string, info os.FileInfo) {
 
 // Write stores bytes atomically and registers the resize in the source index.
 // Caller holds LockOriginal followed by LockCache through generation and publication.
-func (m *Manager) Write(cachePath, originalRel string, originalInfo os.FileInfo, payload []byte) error {
+func (m *Manager) Write(cachePath, originalRel string, originalInfo os.FileInfo, payload []byte) (err error) {
+	defer func() {
+		result := "ok"
+		if err != nil {
+			result = "error"
+		}
+		metrics.CacheWrites.WithLabelValues(result).Inc()
+	}()
 	if originalInfo == nil {
 		return errors.New("source metadata is required")
 	}
 	if len(payload) == 0 {
 		return errors.New("refusing to cache an empty payload")
 	}
-	current, err := os.Stat(filepath.Join(m.cfg.Storage.BaseDir, filepath.FromSlash(originalRel)))
-	if err != nil {
-		return fmt.Errorf("verify source before cache write: %w", err)
+	current, statErr := os.Stat(filepath.Join(m.cfg.Storage.BaseDir, filepath.FromSlash(originalRel)))
+	if statErr != nil {
+		return fmt.Errorf("verify source before cache write: %w", statErr)
 	}
 	if !current.Mode().IsRegular() || signatureFromInfo(current) != signatureFromInfo(originalInfo) {
 		return errors.New("source changed during resize; result was not cached")
@@ -471,7 +480,7 @@ func (m *Manager) invalidateOriginal(ctx context.Context, originalRel string, ge
 		if ctx.Err() != nil {
 			return removed, ctx.Err()
 		}
-		wasRemoved, removeErr := m.removeCacheFileContext(ctx, path, nil)
+		wasRemoved, removeErr := m.removeCacheFileContext(ctx, path, metrics.ReasonInvalidation, nil)
 		if wasRemoved {
 			removed++
 		}
@@ -776,6 +785,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			slog.String("base_dir", m.cfg.Storage.BaseDir))
 	}
 	m.logger.Info("cache cleanup started", slog.String("root", root))
+	sweepStart := time.Now()
 	stats := cleanupStats{}
 	usage := sizeUsage{}
 	staleTempBefore := time.Now().Add(-staleTempFileAge)
@@ -806,7 +816,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			return err
 		}
 		if ttl > 0 && time.Since(info.ModTime()) > ttl {
-			if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); err != nil {
+			if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, metrics.ReasonTTL, &stats); err != nil {
 				m.logger.Warn("remove stale cache", slog.String("path", path), slog.Any("error", err))
 			}
 			return nil
@@ -822,7 +832,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			// cached for rootProbeTTL, so this costs a probe per second rather
 			// than a probe per file.
 			if errors.Is(err, os.ErrNotExist) && m.originalsAvailableFor(rel) {
-				if _, remErr := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); remErr != nil {
+				if _, remErr := m.removeCacheFileIfUnchanged(ctx, path, info, metrics.ReasonOrphan, &stats); remErr != nil {
 					m.logger.Warn("remove orphan cache", slog.String("path", path), slog.Any("error", remErr))
 				}
 				return nil
@@ -831,7 +841,7 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			return nil
 		}
 		if origInfo.ModTime().After(info.ModTime()) {
-			if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, &stats); err != nil {
+			if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, metrics.ReasonOutdated, &stats); err != nil {
 				m.logger.Warn("remove outdated cache", slog.String("path", path), slog.Any("error", err))
 			}
 			return nil
@@ -854,6 +864,13 @@ func (m *Manager) cleanupOnce(ctx context.Context) error {
 			m.logger.Warn("remove cache dir", slog.String("path", dir), slog.Any("error", err))
 		}
 	}
+	// Published only on a completed sweep: a walk that aborted halfway has
+	// counted part of the tree, and a gauge that undercounts is worse than one
+	// that is briefly stale.
+	metrics.CacheSizeBytes.Set(float64(usage.total))
+	metrics.CacheFiles.Set(float64(usage.files))
+	metrics.CacheSweepDuration.Observe(time.Since(sweepStart).Seconds())
+	metrics.CacheSweepLast.SetToCurrentTime()
 	m.logger.Info("cache cleanup finished",
 		slog.Int("files_removed", stats.files),
 		slog.String("bytes_removed", human.FormatBytes(stats.bytes)),
@@ -1031,20 +1048,27 @@ func (m *Manager) removeStaleTemp(path string, d fs.DirEntry, before time.Time) 
 	if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(before) {
 		return
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		m.logger.Warn("remove abandoned temp file", slog.String("path", path), slog.Any("error", err))
+	if err := os.Remove(path); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.logger.Warn("remove abandoned temp file", slog.String("path", path), slog.Any("error", err))
+		}
+		return
 	}
+	metrics.CacheRemovals.WithLabelValues(metrics.ReasonStaleTemp).Inc()
+	metrics.CacheRemovedBytes.WithLabelValues(metrics.ReasonStaleTemp).Add(float64(info.Size()))
 }
 
 // sizeUsage accumulates the cache footprint as an age histogram, so that a cap
 // can be enforced over millions of files without keeping a record per file.
 type sizeUsage struct {
 	total   int64
+	files   int64
 	buckets map[int64]int64
 }
 
 func (u *sizeUsage) add(info os.FileInfo) {
 	u.total += info.Size()
+	u.files++
 	if u.buckets == nil {
 		u.buckets = make(map[int64]int64)
 	}
@@ -1108,7 +1132,7 @@ func (m *Manager) evictBySize(ctx context.Context, limit int64, usage sizeUsage,
 		if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
 			return nil
 		}
-		if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, stats); err != nil {
+		if _, err := m.removeCacheFileIfUnchanged(ctx, path, info, metrics.ReasonSize, stats); err != nil {
 			m.logger.Warn("evict cache entry", slog.String("path", path), slog.Any("error", err))
 			return nil
 		}
@@ -1212,7 +1236,7 @@ func cleanRelativePath(rel string) (string, error) {
 // removeCacheFileIfUnchanged discards cleanup decisions made about a previous
 // version of a file. The observation is revalidated under the publication lock;
 // replacements are left for a later cleanup pass to assess on their own merits.
-func (m *Manager) removeCacheFileIfUnchanged(ctx context.Context, path string, observed os.FileInfo, stats *cleanupStats) (bool, error) {
+func (m *Manager) removeCacheFileIfUnchanged(ctx context.Context, path string, observed os.FileInfo, reason string, stats *cleanupStats) (bool, error) {
 	release, err := m.locks.LockContext(ctx, "cache:"+filepath.Clean(path))
 	if err != nil {
 		return false, err
@@ -1229,20 +1253,22 @@ func (m *Manager) removeCacheFileIfUnchanged(ctx context.Context, path string, o
 	if !os.SameFile(observed, current) || observed.Mode() != current.Mode() || signatureFromInfo(observed) != signatureFromInfo(current) {
 		return false, nil
 	}
-	return m.removeCacheFileLocked(path, stats)
+	return m.removeCacheFileLocked(path, reason, stats)
 }
 
-func (m *Manager) removeCacheFileContext(ctx context.Context, path string, stats *cleanupStats) (bool, error) {
+func (m *Manager) removeCacheFileContext(ctx context.Context, path string, reason string, stats *cleanupStats) (bool, error) {
 	release, err := m.locks.LockContext(ctx, "cache:"+filepath.Clean(path))
 	if err != nil {
 		return false, err
 	}
 	defer release()
-	return m.removeCacheFileLocked(path, stats)
+	return m.removeCacheFileLocked(path, reason, stats)
 }
 
 // Caller must hold LockCache(path) until removal and index updates complete.
-func (m *Manager) removeCacheFileLocked(path string, stats *cleanupStats) (bool, error) {
+// reason is the metrics label explaining why the entry went away; it is the
+// only place removals are counted, so every path through here carries one.
+func (m *Manager) removeCacheFileLocked(path string, reason string, stats *cleanupStats) (bool, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1259,6 +1285,8 @@ func (m *Manager) removeCacheFileLocked(path string, stats *cleanupStats) (bool,
 		return false, err
 	}
 	m.unregisterVariant(path)
+	metrics.CacheRemovals.WithLabelValues(reason).Inc()
+	metrics.CacheRemovedBytes.WithLabelValues(reason).Add(float64(info.Size()))
 	if stats != nil {
 		stats.files++
 		stats.bytes += info.Size()

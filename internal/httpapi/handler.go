@@ -22,6 +22,7 @@ import (
 
 	"fars/internal/cache"
 	"fars/internal/config"
+	"fars/internal/metrics"
 	"fars/internal/processor"
 )
 
@@ -66,6 +67,7 @@ func NewHandler(cfg *config.Config, cache *cache.Manager, processor *processor.P
 			concurrency = runtime.NumCPU()
 		}
 	}
+	metrics.ResizeSlots.Set(float64(concurrency))
 	return &Handler{
 		cfg:       cfg,
 		cache:     cache,
@@ -127,6 +129,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 		h.respondError(c, http.StatusUnsupportedMediaType, fmt.Errorf("unsupported extension %q", ext))
 		return
 	}
+	markFormat(c, string(format))
 	// Every access to an original goes through this root: it resolves each
 	// path component itself and refuses anything that leaves base_dir,
 	// including via a symlink. filepath.Join + os.Stat cannot do that — they
@@ -199,6 +202,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 	cachePath := h.cfg.CachePath(width, height, cacheRel)
 	if h.cache.IsFresh(cachePath, originalInfo) {
 		if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
+			markCache(c, metrics.CacheHit)
 			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start))
 			return
 		}
@@ -226,6 +230,7 @@ func (h *Handler) handleResize(c *gin.Context) {
 	defer release()
 	if h.cache.IsFresh(cachePath, originalInfo) {
 		if served := h.tryServeFromCache(c, cachePath, format, originalInfo); served {
+			markCache(c, metrics.CacheHit)
 			h.logAccess(c, width, height, cacheRel, originalInfo.ModTime(), true, time.Since(start))
 			return
 		}
@@ -245,11 +250,16 @@ func (h *Handler) handleResize(c *gin.Context) {
 	// Admission control: wait for a free slot rather than piling up unbounded
 	// concurrent libvips/canvas work. A queued request only gives up if the
 	// client disconnects while waiting.
+	queued := time.Now()
 	select {
 	case h.resizeSem <- struct{}{}:
 	case <-c.Request.Context().Done():
 		return
 	}
+	metrics.ResizeQueueWait.Observe(time.Since(queued).Seconds())
+	metrics.ResizeInFlight.Inc()
+	metrics.ResizeSourceBytes.Add(float64(len(source)))
+	resizeStart := time.Now()
 
 	payload, err := h.processor.Resize(source, processor.Options{
 		Width:          width,
@@ -267,6 +277,9 @@ func (h *Handler) handleResize(c *gin.Context) {
 	// The slot covers the resize itself and nothing else: held across the
 	// response write, one slow client would keep another resize out.
 	<-h.resizeSem
+	metrics.ResizeInFlight.Dec()
+	metrics.ResizeDuration.WithLabelValues(string(format)).Observe(time.Since(resizeStart).Seconds())
+	markCache(c, metrics.CacheMiss)
 	if err != nil {
 		switch {
 		case errors.Is(err, processor.ErrDimensionsTooLarge), errors.Is(err, processor.ErrDegenerateGeometry):
@@ -417,6 +430,7 @@ func (h *Handler) invalidatePaths(c *gin.Context, paths []string) {
 		if len(counts) < len(invalidated) {
 			failed = invalidated[len(counts)]
 		}
+		metrics.Invalidations.WithLabelValues("error").Inc()
 		h.logger.Error("manual cache invalidation failed", slog.String("path", failed), slog.Any("error", err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":            "cache invalidation failed",
@@ -426,6 +440,7 @@ func (h *Handler) invalidatePaths(c *gin.Context, paths []string) {
 		})
 		return
 	}
+	metrics.Invalidations.WithLabelValues("ok").Inc()
 	c.JSON(http.StatusOK, gin.H{"invalidated": succeeded, "variants_removed": removed})
 }
 
@@ -582,6 +597,7 @@ func (h *Handler) tryServeFromCache(c *gin.Context, cachePath string, format pro
 }
 
 func (h *Handler) respondError(c *gin.Context, code int, err error) {
+	metrics.Errors.WithLabelValues(errorReason(code)).Inc()
 	h.logger.Error("request error",
 		slog.Any("error", err),
 		slog.Int("status", code),
@@ -646,6 +662,11 @@ func matchETag(header string, etag string) bool {
 // logAccess records a successfully served request. Failures are logged by
 // respondError instead, so this only ever reports success.
 func (h *Handler) logAccess(c *gin.Context, width, height int, rel string, originalMod time.Time, cached bool, dur time.Duration) {
+	if !h.cfg.Logging.Access {
+		// Rates, latency and cache ratio are all in the metrics; the line is
+		// only worth its volume when someone needs the individual paths.
+		return
+	}
 	attrs := []any{
 		"remote_ip", c.ClientIP(),
 		"width", width,

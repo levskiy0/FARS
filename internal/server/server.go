@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"fars/internal/cache"
 	"fars/internal/config"
 	"fars/internal/httpapi"
+	"fars/internal/metrics"
 	"fars/internal/version"
 )
 
@@ -40,6 +42,9 @@ func NewEngine(cfg *config.Config, handler *httpapi.Handler) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	// Instrumentation wraps every route, including the ones registered below,
+	// so a panic recovered above still counts as the 500 it returned.
+	r.Use(httpapi.ObserveRequests(sharedMetricsPath(cfg)))
 	// gin defaults to trusting every proxy, which lets any client spoof
 	// X-Forwarded-For and land it verbatim in c.ClientIP() / the access log's
 	// remote_ip field. Only the proxies named in server.trusted_proxies are
@@ -51,7 +56,19 @@ func NewEngine(cfg *config.Config, handler *httpapi.Handler) *gin.Engine {
 		panic(fmt.Errorf("server.trusted_proxies: %w", err))
 	}
 	handler.Register(r)
+	if path := sharedMetricsPath(cfg); path != "" {
+		r.GET(path, gin.WrapH(metrics.Handler()))
+	}
 	return r
+}
+
+// sharedMetricsPath returns the path the exposition endpoint occupies on the
+// main listener, or "" when metrics are disabled or moved to their own port.
+func sharedMetricsPath(cfg *config.Config) string {
+	if cfg == nil || !cfg.Metrics.Enabled || strings.TrimSpace(cfg.Metrics.Listen) != "" {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Metrics.Path)
 }
 
 // RegisterLifecycle wires the HTTP server into fx lifecycle.
@@ -65,6 +82,7 @@ func RegisterLifecycle(p Params) {
 	}
 
 	var backgroundCancel context.CancelFunc
+	metricsSrv := newMetricsServer(p.Config)
 
 	p.Lifecycle.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
@@ -77,15 +95,50 @@ func RegisterLifecycle(p Params) {
 					p.Logger.Error("http server failure", slog.Any("error", err))
 				}
 			}()
+			if metricsSrv != nil {
+				p.Logger.Info("serving metrics", slog.String("addr", metricsSrv.Addr), slog.String("path", p.Config.Metrics.Path))
+				go func() {
+					// A metrics port that cannot bind must not take the image
+					// service down with it; it is reported and the resize
+					// endpoint keeps serving.
+					if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+						p.Logger.Error("metrics server failure", slog.Any("error", err))
+					}
+				}()
+			}
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
 			p.Logger.Info("stopping HTTP server")
 			shutdownErr := srv.Shutdown(ctx)
+			if metricsSrv != nil {
+				shutdownErr = errors.Join(shutdownErr, metricsSrv.Shutdown(ctx))
+			}
 			if backgroundCancel != nil {
 				backgroundCancel()
 			}
 			return errors.Join(shutdownErr, p.Cache.WaitBackground(ctx))
 		},
 	})
+}
+
+// newMetricsServer builds the dedicated exposition listener, or nil when the
+// endpoint shares the API listener (or is switched off entirely).
+func newMetricsServer(cfg *config.Config) *http.Server {
+	if cfg == nil || !cfg.Metrics.Enabled {
+		return nil
+	}
+	addr := strings.TrimSpace(cfg.Metrics.Listen)
+	if addr == "" {
+		return nil
+	}
+	mux := http.NewServeMux()
+	mux.Handle(strings.TrimSpace(cfg.Metrics.Path), metrics.Handler())
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
 }

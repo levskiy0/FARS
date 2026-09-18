@@ -6,6 +6,23 @@ server:
   # opened the connection, i.e. Angie rather than the visitor.
   trusted_proxies: []
 
+# Prometheus exposition. Enabled by default on the API listener; set `listen`
+# to move it to its own host:port when only that port should be reachable from
+# the monitoring network.
+metrics:
+  enabled: true
+  path: /metrics
+  listen: ""
+
+logging:
+  level: info
+  # text or json. text is the default because log shippers in front of FARS
+  # parse the slog `level=INFO` form; switch both together.
+  format: text
+  # One line per served image. Rates, latency and the cache ratio are in the
+  # metrics regardless, so this can go off on a busy catalogue.
+  access: true
+
 storage:
   base_dir: "./data/images/"
   cache_dir: "./data/cache/"

@@ -25,6 +25,10 @@ any directory of static images.
   every cached geometry and format of a source that changed.
 - Purges cache entries by TTL, and — with `cache.max_size` set — by least
   recent use once the cache exceeds the cap.
+- Exports Prometheus metrics on `/metrics`: request rate and latency split by
+  cache hit and miss, resize time per format, admission-queue wait, cache size
+  against its cap, removals by reason, and whether the originals index is
+  ready.
 
 ## Quick start
 
@@ -112,6 +116,12 @@ Other common settings (legacy shortcut on the left, all also reachable as
 | `VIPS_CONCURRENCY` | `0` | threads *inside* one libvips operation — not a request-concurrency knob |
 | `GOMAXPROCS` | `0` | Go scheduler threads |
 | `FARS_SERVER__TRUSTED_PROXIES` | empty | proxies (IPs or CIDRs) whose `X-Forwarded-For` is believed. Empty logs the connecting peer, i.e. your reverse proxy |
+| `FARS_METRICS__ENABLED` | `true` | serve Prometheus metrics |
+| `FARS_METRICS__PATH` | `/metrics` | where they are served |
+| `FARS_METRICS__LISTEN` | empty | move metrics to their own `host:port`, so only that port need be reachable from the monitoring network. Publish it separately: `-p 10.0.0.1:9091:9091` |
+| `FARS_LOGGING__LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `FARS_LOGGING__FORMAT` | `text` | `text` or `json`. Log shippers that parse the slog `level=INFO` form need `text`; change both together |
+| `FARS_LOGGING__ACCESS` | `true` | the per-request line. Rate, latency and cache ratio are in the metrics either way |
 
 Rewrite rules (regex → replacement, first match wins) let a public URL differ
 from the path on disk; they are configured in YAML only. The sample config in
@@ -135,6 +145,18 @@ turn a small width into a huge height.
 | `400` | geometry over the limits, a derived side over the limits, a geometry that would shrink the source below one pixel, or a NUL byte in the path |
 | `404` | no such original, not a regular file, or a path that leaves the originals root through a symlink |
 | `415` | extension FARS does not encode, or bytes libvips cannot decode (including a zero-byte original) |
+
+## Monitoring
+
+`GET /metrics` returns the Prometheus exposition, including the `go_*` and
+`process_*` collectors. The families are documented in the
+[README](https://github.com/levskiy0/FARS#monitoring); the two worth an alert
+are `fars_originals_index_ready` (0 means a changed original will not be
+noticed) and `fars_cache_sweep_last_success_timestamp_seconds` (cleanup no
+longer finishing inside its interval).
+
+The request path is never used as a label, so a crawler cannot inflate
+cardinality.
 
 ## Manual invalidation
 

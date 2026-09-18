@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -78,7 +79,48 @@ type Config struct {
 	Resize   ResizeConfig  `yaml:"resize"`
 	Cache    CacheConfig   `yaml:"cache"`
 	Runtime  RuntimeConfig `yaml:"runtime"`
+	Metrics  MetricsConfig `yaml:"metrics"`
+	Logging  LoggingConfig `yaml:"logging"`
 	Rewrites []RewriteRule `yaml:"rewrites"`
+}
+
+// MetricsConfig describes the Prometheus exposition endpoint.
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
+	// Listen, when set, moves the endpoint to its own host:port instead of
+	// sharing the API listener. That is the deployment where the image
+	// serves the public internet through a proxy and the metrics port is
+	// published only on a private interface.
+	Listen string `yaml:"listen"`
+}
+
+// LoggingConfig describes log output.
+type LoggingConfig struct {
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
+	// Access toggles the per-request line. Metrics cover rates and latency
+	// without it; on a busy catalogue it is the bulk of the log volume.
+	Access bool `yaml:"access"`
+}
+
+// LevelSlog maps the configured level onto slog's.
+func (l LoggingConfig) LevelSlog() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(l.Level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// JSON reports whether logs should be emitted as JSON objects.
+func (l LoggingConfig) JSON() bool {
+	return strings.EqualFold(strings.TrimSpace(l.Format), "json")
 }
 
 // ServerConfig describes HTTP server binding parameters.
@@ -173,6 +215,15 @@ func defaultConfig() *Config {
 			InvalidationLockTimeout: Duration{100 * time.Millisecond},
 		},
 		Runtime: RuntimeConfig{},
+		Metrics: MetricsConfig{
+			Enabled: true,
+			Path:    "/metrics",
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "text",
+			Access: true,
+		},
 	}
 }
 
@@ -466,6 +517,12 @@ func (c *Config) Validate() error {
 	if c.Server.Port <= 0 || c.Server.Port > 65535 {
 		return fmt.Errorf("server.port must be between 1 and 65535, got %d", c.Server.Port)
 	}
+	if err := c.validateMetrics(); err != nil {
+		return err
+	}
+	if err := c.validateLogging(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Storage.BaseDir) == "" {
 		return errors.New("storage.base_dir must be set")
 	}
@@ -741,4 +798,59 @@ func formatGeometryPrefix(width, height int) string {
 		return "0x0"
 	}
 	return w + "x" + h
+}
+
+// validateMetrics keeps the exposition endpoint from silently ending up
+// somewhere it cannot be scraped, or on top of the resize routes.
+func (c *Config) validateMetrics() error {
+	if !c.Metrics.Enabled {
+		return nil
+	}
+	path := strings.TrimSpace(c.Metrics.Path)
+	if path == "" {
+		return errors.New("metrics.path must be set when metrics are enabled")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("metrics.path must start with a slash, got %q", path)
+	}
+	// gin panics when a literal route collides with an existing wildcard one,
+	// which would turn a typo into a crash loop instead of a config error.
+	for _, reserved := range []string{"/resize", "/cache", "/cclear"} {
+		if path == reserved || strings.HasPrefix(path, reserved+"/") {
+			return fmt.Errorf("metrics.path %q collides with the %s routes", path, reserved)
+		}
+	}
+	listen := strings.TrimSpace(c.Metrics.Listen)
+	if listen == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("metrics.listen must be host:port, got %q", listen)
+	}
+	value, err := strconv.Atoi(port)
+	if err != nil || value <= 0 || value > 65535 {
+		return fmt.Errorf("metrics.listen port must be between 1 and 65535, got %q", port)
+	}
+	if host != "" && net.ParseIP(host) == nil {
+		return fmt.Errorf("metrics.listen host must be an IP or empty, got %q", host)
+	}
+	if listen == c.Server.Address() {
+		return errors.New("metrics.listen must differ from the server address; leave it empty to share the API listener")
+	}
+	return nil
+}
+
+func (c *Config) validateLogging() error {
+	switch strings.ToLower(strings.TrimSpace(c.Logging.Level)) {
+	case "", "debug", "info", "warn", "warning", "error":
+	default:
+		return fmt.Errorf("logging.level must be one of debug, info, warn, error, got %q", c.Logging.Level)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Logging.Format)) {
+	case "", "text", "json":
+		return nil
+	default:
+		return fmt.Errorf("logging.format must be text or json, got %q", c.Logging.Format)
+	}
 }

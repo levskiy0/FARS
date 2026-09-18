@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"fars/internal/metrics"
 )
 
 func TestBootstrapRetiredHistoryRecovery(t *testing.T) {
@@ -159,7 +161,7 @@ func TestCleanupRemovalGuard(t *testing.T) {
 				}
 			}
 			var stats cleanupStats
-			removed, err := m.removeCacheFileIfUnchanged(context.Background(), path, observed, &stats)
+			removed, err := m.removeCacheFileIfUnchanged(context.Background(), path, observed, metrics.ReasonTTL, &stats)
 			wantRemoved := !tc.replace && !tc.missing
 			if err != nil || removed != wantRemoved {
 				t.Fatalf("removed=%v, want=%v, err=%v", removed, wantRemoved, err)

@@ -104,6 +104,54 @@ The [detailed cache documentation](docs/cache-monitor.md) includes token setup, 
 
 These tests use temporary data, not production images. They verify FARS's disk cache, not an external Nginx/CDN HTTP cache. Existing resize URLs and cache paths remain unchanged.
 
+## Monitoring
+
+FARS exposes Prometheus metrics at `/metrics` on the API listener. Set
+`metrics.listen` to move the endpoint to its own `host:port` — the deployment
+where the resize port is proxied to the internet and only the metrics port is
+published on a private (e.g. WireGuard) interface. `metrics.enabled: false`
+unregisters the route entirely.
+
+| Metric | Type | What it answers |
+|---|---|---|
+| `fars_http_requests_total{route,method,code,cache}` | counter | request rate, error ratio, and the cache hit ratio (`cache="hit"` vs `"miss"`) |
+| `fars_http_request_duration_seconds{route,cache}` | histogram | latency, separable into hits and misses — averaging them together hides the resize cost |
+| `fars_http_response_bytes_total{route,format}` | counter | bytes served per output format |
+| `fars_request_errors_total{reason}` | counter | why requests failed: `bad_request`, `not_found`, `unsupported_media`, `unauthorized`, `internal` |
+| `fars_resize_duration_seconds{format}` | histogram | time inside libvips alone, per output format |
+| `fars_resize_queue_wait_seconds` | histogram | time spent waiting for an admission slot |
+| `fars_resize_in_flight` / `fars_resize_slots` | gauge | saturation: the ratio of the two is how full the resize pipeline is |
+| `fars_resize_source_bytes_total` | counter | original bytes read for resizing |
+| `fars_cache_writes_total{result}` | counter | variants published, and failures to publish |
+| `fars_cache_removals_total{reason}`, `fars_cache_removed_bytes_total{reason}` | counter | what the cache deletes and why: `ttl`, `orphan`, `outdated`, `size`, `invalidation`, `stale_temp` |
+| `fars_cache_size_bytes`, `fars_cache_files`, `fars_cache_size_limit_bytes` | gauge | cache footprint as of the last sweep, against the configured cap |
+| `fars_cache_sweep_duration_seconds`, `fars_cache_sweep_last_success_timestamp_seconds` | histogram, gauge | whether cleanup still finishes inside its interval |
+| `fars_originals_index_ready` | gauge | 1 once discovery completed. **While it is 0 a changed original is not noticed** — the one to alert on |
+| `fars_originals_tracked` | gauge | originals the monitor watches |
+| `fars_originals_changed_total`, `fars_originals_check_errors_total` | counter | sources seen to change; checks that failed and were deferred |
+| `fars_invalidations_total{result}` | counter | manual invalidation calls |
+| `fars_build_info{version,go_version}` | gauge | always 1, for joining a dashboard to a build |
+
+Plus the standard `go_*` and `process_*` collectors. The request path is never
+a label — it is attacker-controlled, and one crawler would mint a series per
+URL. Anything gin cannot route is counted once as `route="unknown"`.
+
+Series with a bounded label set (error reasons, removal reasons, formats) are
+created at startup so they read `0` from the first scrape, rather than
+appearing only once something goes wrong.
+
+### Logging
+
+`logging.level` (`debug`, `info`, `warn`, `error`) and `logging.format` (`text`
+or `json`) control the log handler. `text` is the default, because shippers in
+front of FARS parse the slog `level=INFO` form — switch a deployment's pipeline
+and this setting together, or the lines arrive unlabelled.
+
+`logging.access: false` drops the per-request `served image` line. Request
+rate, latency and cache ratio are all in the metrics above; the line is only
+worth its volume when the individual paths matter.
+
+
 ## Requirements
 
 - Go 1.27+
@@ -187,6 +235,8 @@ Key points:
 - `storage.base_dir` must already exist: FARS refuses to start otherwise instead of creating it. A missing bind mount used to produce an empty directory, a service that looked healthy, and a cleanup pass that deleted the whole variant cache as "orphans". `cache_dir` is still created on demand, and the two directories may not overlap (neither may be `/`, contain the other, or be the same path).
 - `runtime.gomaxprocs` and `runtime.vips_concurrency` allow tuning Go scheduler threads and libvips worker pool (0 keeps library defaults).
 - `runtime.resize_concurrency` caps how many resizes run at once; `0` means one per `GOMAXPROCS`. Keep it separate from `vips_concurrency`: that one sizes the thread pool *inside* a single libvips operation and is deliberately set to 1 or 2 in production, which is not a sensible number of concurrent requests.
+- `metrics.enabled`, `metrics.path` and `metrics.listen` configure the Prometheus endpoint — see [Monitoring](#monitoring). `metrics.path` is rejected at startup if it collides with the `/resize`, `/cache` or `/cclear` routes, since gin would panic on the overlap instead of reporting it.
+- `logging.level`, `logging.format` and `logging.access` configure log output.
 - `server.trusted_proxies` lists the reverse proxies (IPs or CIDRs) whose `X-Forwarded-For` may be believed, which is what the access log's `remote_ip` reports. Empty (the default) trusts none, so `remote_ip` is the peer that opened the connection — with Angie in front, that is Angie. Set it to the proxy's address to see real client IPs; never widen it to a range that reaches untrusted clients, or they can forge `remote_ip`.
 - Rewrite rules are evaluated sequentially; the first matching pattern rewrites the path and stops the chain.
 
@@ -198,7 +248,10 @@ Every option in the YAML can be supplied through environment variables. Two nami
   - `FARS_SERVER__PORT=8080`
   - `FARS_SERVER__HOST=127.0.0.1`
   - `FARS_STORAGE__BASE_DIR=/srv/images`
-- **Legacy shortcuts (unprefixed)** – a fixed, explicit allowlist kept only for backward compatibility with the shipped `Dockerfile` and existing deployments: `PORT`, `IMAGES_BASE_DIR`, `CACHE_DIR`, `TTL`, `CLEANUP_INTERVAL`, `CHECK_ORIGINALS_INTERVAL`, `INVALIDATION_TOKEN`, `MAX_CACHE_SIZE`, plus the resize quality/limit keys (`MAX_WIDTH`, `MAX_HEIGHT`, `JPG_QUALITY`, `WEBP_QUALITY`, `AVIF_QUALITY`, `PNG_COMPRESSION`, `AVIF_SPEED`, `GOMAXPROCS`, `VIPS_CONCURRENCY`, `RESIZE_CONCURRENCY`). This surface is intentionally narrow: it does not support the `FOO__BAR` nested-path syntax, and it does **not** include a generic `HOST` — an ambient, unrelated `HOST` variable in the environment can no longer repoint the service. Use `FARS_HOST` for that. New deployments should prefer `FARS_`-prefixed variables throughout.
+- **Legacy shortcuts (unprefixed)** – a fixed, explicit allowlist kept only for backward compatibility with the shipped `Dockerfile` and existing deployments: `PORT`, `IMAGES_BASE_DIR`, `CACHE_DIR`, `TTL`, `CLEANUP_INTERVAL`, `CHECK_ORIGINALS_INTERVAL`, `INVALIDATION_TOKEN`, `MAX_CACHE_SIZE`, plus the resize quality/limit keys (`MAX_WIDTH`, `MAX_HEIGHT`, `JPG_QUALITY`, `WEBP_QUALITY`, `AVIF_QUALITY`, `PNG_COMPRESSION`, `AVIF_SPEED`, `GOMAXPROCS`, `VIPS_CONCURRENCY`, `RESIZE_CONCURRENCY`). This surface is intentionally narrow: it does not support the `FOO__BAR` nested-path syntax, and it does **not** include a generic `HOST` — an ambient, unrelated `HOST` variable in the environment can no longer repoint the service. Use `FARS_HOST` for that. New deployments should prefer `FARS_`-prefixed variables throughout. The
+metrics and logging settings are deliberately not in the legacy list:
+`FARS_METRICS__ENABLED`, `FARS_METRICS__LISTEN`, `FARS_LOGGING__FORMAT` and so
+on are the only spellings.
 
 Environment values override the built-in defaults and anything read from YAML. Between the two styles, the `FARS_`-prefixed value is applied last and wins if a setting is provided both ways. Duration strings support the same syntax as the config file (`36h`, `15m30s`), and byte sizes accept units like `512kb`, `2mb`, `1giB`.
 

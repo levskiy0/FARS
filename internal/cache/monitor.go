@@ -11,6 +11,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"fars/internal/metrics"
 )
 
 const defaultMonitorWorkers = 4
@@ -246,6 +248,7 @@ func (m *Manager) runKeyedWorkers(
 			completed++
 			if result.err != nil && ctx.Err() == nil {
 				failed++
+				metrics.OriginalsCheckErrors.Inc()
 				m.logger.Warn("cache worker task deferred", slog.String("job", name), slog.String("path", result.key), slog.Any("error", result.err))
 			}
 		case <-ticker.C:
@@ -353,6 +356,7 @@ func (m *Manager) checkOriginal(ctx context.Context, rel string) error {
 	// Do not invalidate a replacement index entry based on an obsolete observation.
 	if current := m.originals[rel]; current != nil && current.Signature == signature {
 		m.markPendingLocked(rel, current)
+		metrics.OriginalsChanged.Inc()
 	}
 	m.indexMu.Unlock()
 	return nil
@@ -388,7 +392,7 @@ func (m *Manager) invalidatePending(ctx context.Context, key string) error {
 	if !pending || registered {
 		return nil
 	}
-	_, err = m.removeCacheFileLocked(path, nil)
+	_, err = m.removeCacheFileLocked(path, metrics.ReasonOrphan, nil)
 	if err == nil {
 		m.indexMu.Lock()
 		delete(m.pendingOrphans, path)
@@ -617,6 +621,8 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 		}
 		m.indexGeneration++
 	}
+	metrics.OriginalsIndexReady.Set(boolGauge(ready))
+	metrics.OriginalsTracked.Set(float64(len(m.originals)))
 	m.indexMu.Unlock()
 	stats := m.Stats()
 	m.logger.Info("cache discovery progress", slog.Bool("complete", ready),
@@ -685,4 +691,13 @@ func (m *Manager) indexCacheReference(ctx context.Context, cacheRel string, path
 		}
 	}
 	return nil
+}
+
+// boolGauge renders a condition the way Prometheus expects one: a gauge of 1
+// or 0, so that alerting can use it arithmetically.
+func boolGauge(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }
