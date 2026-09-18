@@ -217,6 +217,8 @@ Environment values override the built-in defaults and anything read from YAML. B
 
 ## Docker
 
+Published as [`dementev/fars`](https://hub.docker.com/r/dementev/fars) for `linux/amd64` and `linux/arm64`. The page shown there is [`docs/dockerhub.md`](docs/dockerhub.md), which documents the image itself — volumes, the uid it runs as, and every environment variable it honours.
+
 To build:
 ```bash
 docker build -t fars:latest .
