@@ -621,8 +621,6 @@ func (m *Manager) bootstrapIndex(ctx context.Context) error {
 		}
 		m.indexGeneration++
 	}
-	metrics.OriginalsIndexReady.Set(boolGauge(ready))
-	metrics.OriginalsTracked.Set(float64(len(m.originals)))
 	m.indexMu.Unlock()
 	stats := m.Stats()
 	m.logger.Info("cache discovery progress", slog.Bool("complete", ready),
@@ -691,13 +689,4 @@ func (m *Manager) indexCacheReference(ctx context.Context, cacheRel string, path
 		}
 	}
 	return nil
-}
-
-// boolGauge renders a condition the way Prometheus expects one: a gauge of 1
-// or 0, so that alerting can use it arithmetically.
-func boolGauge(v bool) float64 {
-	if v {
-		return 1
-	}
-	return 0
 }

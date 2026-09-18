@@ -41,10 +41,12 @@ type Params struct {
 func NewEngine(cfg *config.Config, handler *httpapi.Handler) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Recovery())
-	// Instrumentation wraps every route, including the ones registered below,
-	// so a panic recovered above still counts as the 500 it returned.
+	// Instrumentation goes outside Recovery, not inside it. A panic unwinds
+	// past every middleware between it and the recover(), so an inner
+	// ObserveRequests would skip its own bookkeeping and the 500 the client
+	// received would appear nowhere in the metrics.
 	r.Use(httpapi.ObserveRequests(sharedMetricsPath(cfg)))
+	r.Use(gin.Recovery())
 	// gin defaults to trusting every proxy, which lets any client spoof
 	// X-Forwarded-For and land it verbatim in c.ClientIP() / the access log's
 	// remote_ip field. Only the proxies named in server.trusted_proxies are

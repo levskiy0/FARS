@@ -181,3 +181,30 @@ func TestMetricsServerNilWhenShared(t *testing.T) {
 		t.Fatal("newMetricsServer returned a server while metrics are disabled")
 	}
 }
+
+// TestPanicIsCountedAsAServedFiveHundred pins the middleware order. With
+// ObserveRequests registered inside gin.Recovery(), a panic unwound straight
+// past its bookkeeping: the client got a 500 that appeared in no counter, no
+// duration histogram and no error total — invisible exactly where visibility
+// matters most.
+func TestPanicIsCountedAsAServedFiveHundred(t *testing.T) {
+	engine := newMetricsTestEngine(t, config.MetricsConfig{Enabled: true, Path: "/metrics"})
+	engine.GET("/boom", func(c *gin.Context) { panic("libvips said no") })
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/boom", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if v := sampleValue(t, body, `fars_http_requests_total{cache="none",code="500",method="GET",route="unknown"}`); v < 1 {
+		t.Errorf("panicking request counted %v times, want at least 1", v)
+	}
+	if v := sampleValue(t, body, `fars_http_request_duration_seconds_count{cache="none",route="unknown"}`); v < 1 {
+		t.Errorf("panicking request produced %v duration samples, want at least 1", v)
+	}
+}

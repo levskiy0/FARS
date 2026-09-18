@@ -261,24 +261,31 @@ func (h *Handler) handleResize(c *gin.Context) {
 	metrics.ResizeSourceBytes.Add(float64(len(source)))
 	resizeStart := time.Now()
 
-	payload, err := h.processor.Resize(source, processor.Options{
-		Width:          width,
-		Height:         height,
-		Format:         format,
-		JPEGQuality:    h.cfg.Resize.JPGQuality,
-		WebPQuality:    h.cfg.Resize.WebPQuality,
-		AVIFQuality:    h.cfg.Resize.AVIFQuality,
-		AVIFSpeed:      h.cfg.Resize.AVIFSpeed,
-		PNGCompression: h.cfg.Resize.PNGCompression,
-		EnsureOpaque:   ensureOpaque,
-		MaxWidth:       h.cfg.Resize.MaxWidth,
-		MaxHeight:      h.cfg.Resize.MaxHeight,
-	})
-	// The slot covers the resize itself and nothing else: held across the
-	// response write, one slow client would keep another resize out.
-	<-h.resizeSem
-	metrics.ResizeInFlight.Dec()
-	metrics.ResizeDuration.WithLabelValues(string(format)).Observe(time.Since(resizeStart).Seconds())
+	payload, err := func() ([]byte, error) {
+		// The slot covers the resize itself and nothing else: held across the
+		// response write, one slow client would keep another resize out.
+		// Released through a defer because libvips is cgo — a panic in there
+		// would otherwise retire the slot for the life of the process and
+		// leave resize_in_flight stuck a notch above zero.
+		defer func() {
+			<-h.resizeSem
+			metrics.ResizeInFlight.Dec()
+			metrics.ResizeDuration.WithLabelValues(string(format)).Observe(time.Since(resizeStart).Seconds())
+		}()
+		return h.processor.Resize(source, processor.Options{
+			Width:          width,
+			Height:         height,
+			Format:         format,
+			JPEGQuality:    h.cfg.Resize.JPGQuality,
+			WebPQuality:    h.cfg.Resize.WebPQuality,
+			AVIFQuality:    h.cfg.Resize.AVIFQuality,
+			AVIFSpeed:      h.cfg.Resize.AVIFSpeed,
+			PNGCompression: h.cfg.Resize.PNGCompression,
+			EnsureOpaque:   ensureOpaque,
+			MaxWidth:       h.cfg.Resize.MaxWidth,
+			MaxHeight:      h.cfg.Resize.MaxHeight,
+		})
+	}()
 	markCache(c, metrics.CacheMiss)
 	if err != nil {
 		switch {

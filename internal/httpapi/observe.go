@@ -52,7 +52,9 @@ func ObserveRequests(metricsPath string) gin.HandlerFunc {
 
 		metrics.HTTPRequests.WithLabelValues(route, c.Request.Method, status, cache).Inc()
 		metrics.HTTPDuration.WithLabelValues(route, cache).Observe(elapsed.Seconds())
-		if size := c.Writer.Size(); size > 0 {
+		// Only successful responses: an error page is not image bytes, and
+		// counting it under format="none" made the series mean two things.
+		if size := c.Writer.Size(); size > 0 && c.Writer.Status() < http.StatusMultipleChoices {
 			format := "none"
 			if v, ok := c.Get(formatKey); ok {
 				format, _ = v.(string)

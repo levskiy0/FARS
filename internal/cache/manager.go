@@ -153,7 +153,18 @@ func NewManager(cfg *config.Config, logger *slog.Logger) *Manager {
 	if cfg != nil {
 		m.SetMaxCacheSize(cfg.Cache.MaxSize.Bytes)
 	}
+	// Read at scrape time rather than pushed from the call sites that mutate
+	// the index: there are several, and a gauge is only as truthful as the
+	// least maintained of them.
+	metrics.SetIndexStats(m.indexStats)
 	return m
+}
+
+// indexStats reports the live size and readiness of the originals index.
+func (m *Manager) indexStats() (int, bool) {
+	m.indexMu.RLock()
+	defer m.indexMu.RUnlock()
+	return len(m.originals), m.indexReady
 }
 
 // SetMaxCacheSize caps the total size of the cache directory. Zero disables

@@ -12,6 +12,7 @@ package metrics
 import (
 	"net/http"
 	"runtime/debug"
+	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -41,6 +42,33 @@ const (
 )
 
 var registry = prometheus.NewRegistry()
+
+// indexStats is installed by the cache manager and read at scrape time. The
+// index changes on every published and invalidated variant; a gauge updated
+// at those call sites would be one forgotten call site away from lying, and
+// it did lie — originals_tracked stayed at whatever discovery last saw.
+var indexStats atomic.Pointer[IndexStatsFunc]
+
+// IndexStatsFunc reports the live state of the originals index.
+type IndexStatsFunc func() (tracked int, ready bool)
+
+// SetIndexStats installs the callback behind fars_originals_tracked and
+// fars_originals_index_ready. It must be cheap: it runs inside a scrape.
+func SetIndexStats(fn IndexStatsFunc) {
+	if fn == nil {
+		indexStats.Store(nil)
+		return
+	}
+	indexStats.Store(&fn)
+}
+
+func readIndexStats() (int, bool) {
+	fn := indexStats.Load()
+	if fn == nil {
+		return 0, false
+	}
+	return (*fn)()
+}
 
 var (
 	// BuildInfo is the usual join target: 1, labelled with what is running.
@@ -151,18 +179,6 @@ var (
 		Help: "Unix time of the last cleanup sweep that finished without error.",
 	})
 
-	OriginalsTracked = newGauge(prometheus.GaugeOpts{
-		Name: "originals_tracked",
-		Help: "Originals the monitor currently watches.",
-	})
-
-	// OriginalsIndexReady is the one to alert on: while it is 0 a changed
-	// original is not noticed, and invalidation falls back to a scan.
-	OriginalsIndexReady = newGauge(prometheus.GaugeOpts{
-		Name: "originals_index_ready",
-		Help: "1 once cache discovery has completed, 0 while it has not.",
-	})
-
 	OriginalsChanged = newCounter(prometheus.CounterOpts{
 		Name: "originals_changed_total",
 		Help: "Originals seen to change, each invalidating its variants.",
@@ -183,6 +199,27 @@ func init() {
 	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "originals_tracked",
+			Help:      "Originals the monitor currently watches.",
+		}, func() float64 {
+			tracked, _ := readIndexStats()
+			return float64(tracked)
+		}),
+		// The one to alert on: while it is 0 a changed original is not
+		// noticed, and invalidation falls back to a scan.
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "originals_index_ready",
+			Help:      "1 once cache discovery has completed, 0 while it has not.",
+		}, func() float64 {
+			_, ready := readIndexStats()
+			if ready {
+				return 1
+			}
+			return 0
+		}),
 	)
 	goVersion := "unknown"
 	if info, ok := debug.ReadBuildInfo(); ok && info.GoVersion != "" {
