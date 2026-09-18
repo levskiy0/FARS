@@ -126,6 +126,27 @@ var (
 		Help: "Configured maximum of concurrent resizes.",
 	})
 
+	// GOMAXPROCS and VIPSConcurrency are exported so the effective CPU
+	// settings can be read off a dashboard instead of by exec'ing into the
+	// container and comparing config against the cgroup by hand.
+	GOMAXPROCS = newGauge(prometheus.GaugeOpts{
+		Name: "gomaxprocs",
+		Help: "Threads the Go scheduler may run, after any configured override.",
+	})
+
+	// CPUQuota is the other half of the comparison: alerting on
+	// fars_gomaxprocs > fars_cpu_quota catches the oversubscription that
+	// otherwise only shows up as unexplained throttling in cAdvisor.
+	CPUQuota = newGauge(prometheus.GaugeOpts{
+		Name: "cpu_quota",
+		Help: "CPUs the cgroup allows, or 0 when unlimited or unreadable.",
+	})
+
+	VIPSConcurrency = newGauge(prometheus.GaugeOpts{
+		Name: "vips_concurrency",
+		Help: "Threads inside one libvips operation.",
+	})
+
 	ResizeSourceBytes = newCounter(prometheus.CounterOpts{
 		Name: "resize_source_bytes_total",
 		Help: "Original bytes read from storage for resizing.",

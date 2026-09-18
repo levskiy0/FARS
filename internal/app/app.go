@@ -11,6 +11,7 @@ import (
 	"fars/internal/config"
 	"fars/internal/httpapi"
 	"fars/internal/locker"
+	"fars/internal/metrics"
 	"fars/internal/processor"
 	"fars/internal/server"
 )
@@ -58,12 +59,46 @@ func applyRuntimeTuning(logger *slog.Logger, cfg *config.Config) {
 	if cfg == nil {
 		return
 	}
+	// Since Go 1.25 the runtime applies the cgroup CPU quota itself, so a
+	// container limited to 6 CPUs on a 64-core host gets GOMAXPROCS=6 without
+	// being told, and keeps tracking the limit if it changes. Configuring it
+	// by hand replaces that and freezes the tracking, so the only thing to do
+	// with an unset value is nothing.
+	effective := runtime.GOMAXPROCS(0)
 	if cfg.Runtime.GOMAXPROCS > 0 {
-		prev := runtime.GOMAXPROCS(cfg.Runtime.GOMAXPROCS)
-		logger.Info("set GOMAXPROCS", "value", cfg.Runtime.GOMAXPROCS, "previous", prev)
+		effective = cfg.Runtime.GOMAXPROCS
+		runtime.GOMAXPROCS(effective)
 	}
-	if cfg.Runtime.VIPSConcurrency > 0 {
-		configureVipsConcurrency(cfg.Runtime.VIPSConcurrency)
-		logger.Info("set libvips concurrency", "value", cfg.Runtime.VIPSConcurrency)
+
+	quota := detectCPUQuota()
+	attrs := []any{"value", effective, "host_cpus", runtime.NumCPU()}
+	if quota > 0 {
+		attrs = append(attrs, "cpu_quota", quota)
 	}
+	switch {
+	case quota > 0 && float64(effective) > quota:
+		// The condition the pinned setting was meant to prevent and ended up
+		// causing: more runnable threads than the quota can serve, so the
+		// kernel stops the process for the rest of every scheduling period.
+		logger.Warn("GOMAXPROCS is above the container CPU quota; the kernel will throttle", attrs...)
+	case cfg.Runtime.GOMAXPROCS > 0:
+		logger.Info("GOMAXPROCS pinned by configuration", attrs...)
+	default:
+		logger.Info("GOMAXPROCS derived from the CPU limit", attrs...)
+	}
+	metrics.GOMAXPROCS.Set(float64(effective))
+	metrics.CPUQuota.Set(quota)
+
+	// libvips counts the host's CPUs, not the cgroup quota, so left alone it
+	// starts a thread pool sized for the machine inside a container that may
+	// only run a fraction of it. It is always set explicitly for that reason;
+	// the default of 1 keeps parallelism where it is measurable — across
+	// requests — instead of inside one operation.
+	concurrency := cfg.Runtime.VIPSConcurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	configureVipsConcurrency(concurrency)
+	metrics.VIPSConcurrency.Set(float64(concurrency))
+	logger.Info("libvips concurrency", "value", concurrency)
 }
