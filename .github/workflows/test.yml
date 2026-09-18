@@ -10,6 +10,9 @@ on:
   workflow_call:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
@@ -21,10 +24,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
+      # setup-go v6+ exports GOTOOLCHAIN=local, so the version it installs is
+      # the one that runs: it reads go.mod's toolchain directive, not the go one.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -47,11 +52,14 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Both tools are pinned: @latest turns an unrelated upstream release into
+      # a red build, and with GOTOOLCHAIN=local a tool that starts requiring a
+      # newer Go than go.mod's toolchain cannot bootstrap one. Bump on purpose.
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
       - name: Test (race, including integration-tagged)
         run: go test -race -tags=integration ./...
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
