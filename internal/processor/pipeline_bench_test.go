@@ -2,15 +2,18 @@ package processor
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/jpeg"
 	"image/png"
+	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/h2non/bimg"
 )
 
 // syntheticPhoto builds a JPEG that costs roughly what a catalogue image
@@ -99,35 +102,131 @@ func BenchmarkResize(b *testing.B) {
 	}
 }
 
-// TestPipelineOutputDigests pins the bytes each pipeline shape produces. It is
-// the guard for optimisation work: a change that only removes work leaves
-// every digest untouched, and one that alters a pixel shows up here rather
-// than in production.
-func TestPipelineOutputDigests(t *testing.T) {
-	photo := syntheticPhoto(t, 800, 600)
+// TestFlattenSkipMatchesTheFlattenedPipeline is the guard on the optimisation
+// that stopped routing opaque sources through a full-resolution flatten. The
+// fast path resamples from the original instead of from the flattened PNG, so
+// the bytes are not identical; what has to hold is that the image is not.
+//
+// Digests cannot be pinned here: the exact output depends on the libvips,
+// libjpeg and libwebp the host provides, so a golden hash would fail on every
+// machine but the one that recorded it. A bound on the pixel difference
+// against the pipeline this replaced says the same thing and survives a
+// library upgrade.
+func TestFlattenSkipMatchesTheFlattenedPipeline(t *testing.T) {
+	photo, err := os.ReadFile(filepath.Join("..", "..", "tests", "images", "test.jpg"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
 	sprite := syntheticSprite(t, 400, 400)
-	p := New()
 
 	for _, tc := range []struct {
-		name   string
-		source []byte
-		opts   Options
+		name    string
+		source  []byte
+		opts    Options
+		maxMean float64 // mean absolute channel difference, out of 255
 	}{
-		{"photo_jpeg_canvas", photo, benchOptions(FormatJPEG, 200, 200, true)},
-		{"photo_webp_canvas", photo, benchOptions(FormatWEBP, 200, 200, true)},
-		{"photo_png_canvas", photo, benchOptions(FormatPNG, 200, 200, true)},
-		{"photo_webp_free_axis", photo, benchOptions(FormatWEBP, 200, 0, true)},
-		{"sprite_png_canvas", sprite, benchOptions(FormatPNG, 200, 200, false)},
-		{"sprite_jpeg_canvas", sprite, benchOptions(FormatJPEG, 200, 200, false)},
-		{"sprite_png_flattened", sprite, benchOptions(FormatPNG, 200, 200, true)},
+		{"opaque photo to jpeg", photo, benchOptions(FormatJPEG, 200, 200, true), 3},
+		{"opaque photo to webp", photo, benchOptions(FormatWEBP, 200, 200, true), 3},
+		{"opaque photo to png", photo, benchOptions(FormatPNG, 200, 200, true), 3},
+		// A source with real transparency still goes through the flatten, so
+		// for it the two pipelines must agree exactly.
+		{"transparent sprite to jpeg", sprite, benchOptions(FormatJPEG, 200, 200, true), 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := p.Resize(tc.source, tc.opts)
+			fast, err := New().Resize(tc.source, tc.opts)
 			if err != nil {
 				t.Fatalf("Resize: %v", err)
 			}
-			sum := sha256.Sum256(out)
-			t.Logf("%s digest=%s bytes=%d", tc.name, hex.EncodeToString(sum[:8]), len(out))
+			slow, err := flattenedReference(t, tc.source, tc.opts)
+			if err != nil {
+				t.Fatalf("reference pipeline: %v", err)
+			}
+			mean, worst := compareImages(t, fast, slow)
+			if mean > tc.maxMean {
+				t.Fatalf("mean channel difference %.3f/255 (worst %.0f) exceeds %.0f", mean, worst, tc.maxMean)
+			}
+			t.Logf("mean %.3f/255, worst %.0f/255", mean, worst)
 		})
 	}
+}
+
+// flattenedReference reproduces the pipeline as it was before opaque sources
+// skipped the flatten: composite onto white at full resolution, shrink that,
+// then render the canvas.
+func flattenedReference(t *testing.T, source []byte, opts Options) ([]byte, error) {
+	t.Helper()
+	p := New()
+	if converted := toSRGB(source); converted != nil {
+		source = converted
+	}
+	size, err := bimg.NewImage(source).Size()
+	if err != nil {
+		return nil, err
+	}
+	flattened, err := p.flattenToWhite(source)
+	if err != nil {
+		return nil, err
+	}
+	scale := math.Min(float64(opts.Width)/float64(size.Width), float64(opts.Height)/float64(size.Height))
+	stageWidth, stageHeight := 0, 0
+	if float64(opts.Width)/float64(size.Width) <= float64(opts.Height)/float64(size.Height) {
+		stageWidth = int(math.Round(float64(size.Width) * scale))
+	} else {
+		stageHeight = int(math.Round(float64(size.Height) * scale))
+	}
+	stage, err := bimg.NewImage(flattened).Process(bimg.Options{
+		Type:          bimg.PNG,
+		StripMetadata: true,
+		Width:         stageWidth,
+		Height:        stageHeight,
+		Force:         true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return p.renderCanvas(stage, opts)
+}
+
+// compareImages returns the mean and worst absolute per-channel difference
+// between two encoded images of the same size.
+func compareImages(t *testing.T, a, b []byte) (mean float64, worst float64) {
+	t.Helper()
+	left := decodeForCompare(t, a)
+	right := decodeForCompare(t, b)
+	if left.Bounds() != right.Bounds() {
+		t.Fatalf("bounds differ: %v vs %v", left.Bounds(), right.Bounds())
+	}
+	var sum float64
+	var n int
+	for y := left.Bounds().Min.Y; y < left.Bounds().Max.Y; y++ {
+		for x := left.Bounds().Min.X; x < left.Bounds().Max.X; x++ {
+			r1, g1, b1, _ := left.At(x, y).RGBA()
+			r2, g2, b2, _ := right.At(x, y).RGBA()
+			for _, d := range []float64{
+				math.Abs(float64(r1>>8) - float64(r2>>8)),
+				math.Abs(float64(g1>>8) - float64(g2>>8)),
+				math.Abs(float64(b1>>8) - float64(b2>>8)),
+			} {
+				sum += d
+				worst = math.Max(worst, d)
+				n++
+			}
+		}
+	}
+	return sum / float64(n), worst
+}
+
+func decodeForCompare(t *testing.T, payload []byte) image.Image {
+	t.Helper()
+	// WebP is not in the stdlib decoders, so everything is normalised through
+	// libvips into PNG before being decoded for comparison.
+	asPNG, err := bimg.NewImage(payload).Convert(bimg.PNG)
+	if err != nil {
+		t.Fatalf("convert for comparison: %v", err)
+	}
+	decoded, err := png.Decode(bytes.NewReader(asPNG))
+	if err != nil {
+		t.Fatalf("decode for comparison: %v", err)
+	}
+	return decoded
 }

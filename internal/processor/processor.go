@@ -129,10 +129,6 @@ func (p *Processor) Resize(source []byte, opts Options) ([]byte, error) {
 				Height:        stageHeight,
 				Embed:         false,
 				Force:         true,
-				// The staging buffer is decoded again a few lines down and
-				// never leaves the process, so deflating it is paid twice for
-				// nothing. PNG is lossless at every level: same pixels.
-				Compression: 0,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("shrink source: %w", err)
@@ -228,7 +224,6 @@ func (p *Processor) resizeWithCanvas(img *bimg.Image, opts Options) ([]byte, err
 		NoAutoRotate:  false,
 		Embed:         false,
 		Force:         false,
-		Compression:   0, // intermediate only, see the shrink path
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prepare source for canvas: %w", err)
@@ -428,8 +423,7 @@ func needsFlatten(source []byte, opts Options) bool {
 // transparency.
 func (p *Processor) flattenToWhite(source []byte) ([]byte, error) {
 	pngData, err := bimg.NewImage(source).Process(bimg.Options{
-		Type:        bimg.PNG,
-		Compression: 0, // intermediate only
+		Type: bimg.PNG,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("convert to png: %w", err)
