@@ -12,7 +12,9 @@ Go source for FARS, the image-resize service Citimarine uses to generate thumbna
 ## Layout
 
 `cmd/fars-server` (entrypoint) · `internal/` (implementation) · `pkg/` (exported packages) ·
-`tests/` (fixture images + cache) · `example.config.yaml` (copy to `config.yaml` to run).
+`tests/` (fixture images + cache) · `data/{images,cache}` (local run scratch, gitignored) · `docs/` · `example.config.yaml` (copy to `config.yaml` to run; gitignored). Packages under `internal/`: `app`, `cache`, `config`, `httpapi`, `locker`, `metrics`, `processor`, `server`, `version`.
+
+CI is GitHub Actions (`.github/workflows/`): `test.yml` on `develop` pushes and PRs (gofmt, vet, staticcheck, race + integration tests, govulncheck; libvips installed); `docker-build-push.yml` on `main` pushes builds linux/amd64 + arm64 and pushes `dementev/fars` to Docker Hub, then syncs `docs/dockerhub.md` as the Hub description. Every env's compose references `dementev/fars:latest`, so a `main` push publishes what the next pull deploys.
 
 ## Commands
 
@@ -28,20 +30,20 @@ make fmt         # gofmt -w ./cmd ./internal ./pkg ./tests   (fmt-check: fail in
 make clean       # remove the binary
 ```
 
-`GOCACHE` is pinned to `./.gocache`. `docs/dockerhub.md` describes the published image (`dementev/fars:latest`, linux/amd64 + arm64).
+`GOCACHE` is pinned to `./.gocache`. `make test-race` is an alias of `make test`. The repo-root `fars` binary is a build artifact (gitignored).
 
 ## Local dev integration
 
-FARS is **not bind-mounted** — the front stack runs the prebuilt `dementev/fars:latest` image,
-so editing Go source here has no effect on the running stack until you rebuild the image:
+FARS's Go source is **not bind-mounted** — the front stack runs the prebuilt `dementev/fars:latest` image, so editing source here has no effect on the running stack until you rebuild the image:
 
 ```bash
 cd ~/Clients/Citimarine/_code/fars
-make test && docker build -t dementev/fars:latest .
-cd ../infrastructure/citimarine/local && make down && make up
+make test && docker build --network host -t dementev/fars:latest .
+cd ../infrastructure/citimarine/local && make up      # recreates only the changed container
 ```
+
+What the umbrella does mount into `fars-1` (`emit_fars_mounts` in `just umbrella-mounts`, front stack): the theme at `/app/data/images/themes/citimarinestore:ro` and every cloned module at `/app/data/images/modules/<name>:ro`, because FARS reads originals from there. A new module's images are invisible to FARS (every resize 404s) until `just umbrella-mounts` is rerun and the stack recreated.
 
 The PrestaShop-side integration (Smarty helpers that emit `/resize/{w}x{h}/{path}` URLs) lives
 in a separate module, `modules/cm_fars` — a change to image *URLs* usually belongs there, not
-here. Angie routes `/resize/…` (only through the named location `@resize_backend`) to this service on port 9090; Prometheus scrapes
-`/metrics` from a separate listener on 9180 (job `ctm_fars`).
+here. Angie routes `/resize/…` (only through the named location `@resize_backend`) to this service on port 9090. Metrics are on by default at `/metrics` on the API listener; infra's `configs/fars/fars.config.yaml` moves them to a separate listener on 9180, which Prometheus scrapes (job `ctm_fars`).
